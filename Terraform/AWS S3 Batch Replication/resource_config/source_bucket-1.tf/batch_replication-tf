@@ -1,22 +1,26 @@
 data "aws_caller_identity" "acct" {}
 
-# One-time backfill with S3 Batch Operations (only items not yet replicated)
 resource "aws_s3control_job" "backfill" {
-  count      = var.enable_batch_replication ? 1 : 0
-  account_id = data.aws_caller_identity.acct.account_id
-  role_arn   = aws_iam_role.replication.arn
-  priority   = 10
+  count       = var.enable_batch_replication ? 1 : 0
+  account_id  = data.aws_caller_identity.acct.account_id
+  role_arn    = aws_iam_role.replication.arn
+  priority    = 10
   description = "Backfill existing objects from ${local.src_bucket_name} to ${var.dst_bucket_name}"
 
   manifest_generator {
     s3_job_manifest_generator {
       expected_bucket_owner = data.aws_caller_identity.acct.account_id
       source_bucket         = local.src_bucket_arn
-      filter { object_replication_statuses = ["NONE"] }
+
+      filter {
+        object_replication_statuses = ["NONE"]
+      }
     }
   }
 
-  operation { s3_replicate_object {} }
+  operation {
+    s3_replicate_object {}
+  }
 
   report {
     bucket       = local.dst_bucket_arn
