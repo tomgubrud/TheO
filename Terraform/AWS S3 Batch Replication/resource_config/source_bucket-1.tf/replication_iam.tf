@@ -42,7 +42,13 @@ data "aws_iam_policy_document" "replication_permissions" {
       "s3:GetObjectVersionTagging",
       "s3:GetObjectVersionForReplication",
       "s3:GetObjectLegalHold",
-      "s3:GetObjectRetention"
+      "s3:GetObjectRetention",
+      "s3:PutInventoryConfiguration",
+      "s3:GetInventoryConfiguration",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:GetBucketLocation",
+      "s3:GetBucketVersioning"
     ]
     resources = ["${local.src_bucket_arn}/*"]
   }
@@ -56,7 +62,13 @@ data "aws_iam_policy_document" "replication_permissions" {
       "s3:ObjectOwnerOverrideToBucketOwner",
       "s3:PutObject",
       "s3:PutObjectAcl",
-      "s3:PutObjectTagging"
+      "s3:PutObjectTagging",
+      "s3:PutInventoryConfiguration",
+      "s3:GetInventoryConfiguration",
+      "s3:ListBucket",
+      "s3:ListBucketVersions",
+      "s3:GetBucketLocation",
+      "s3:GetBucketVersioning"
     ]
     resources = ["${local.dst_bucket_arn}/*"]
   }
