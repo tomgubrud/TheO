@@ -1,17 +1,13 @@
-#!/bin/bash
-
-# --- config you can edit ---
-export AWS_REGION=us-east-2
+AWS_REGION=us-east-2
 SRC_BUCKET="dev-sdp-repl-source-1-s3-bucket-ncz"
-DST_BUCKET="dev-sdp-repl-target-1-s3-bucket-ncz"
+DST_BUCKET="dev-sdp-repl-target-1-s3-bucket-ncz"   # use any bucket you want for the manifest output
+MANIFEST_PREFIX="batch-replication-manifests/"
 REPORT_PREFIX="batch-replication-reports/"
-ROLE_NAME="sdp-19-s3-replication"   # <-- your replication role name
+ROLE_NAME="sdp-19-s3-replication"
 
-# --- derive values ---
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
 
-# --- create the Batch Replication job ---
 aws s3control create-job \
   --region "$AWS_REGION" \
   --account-id "$ACCOUNT_ID" \
@@ -20,16 +16,23 @@ aws s3control create-job \
   --description "Backfill existing objects from $SRC_BUCKET to $DST_BUCKET" \
   --operation '{"S3ReplicateObject":{}}' \
   --manifest-generator "{
-      \"S3JobManifestGenerator\":{
-        \"ExpectedBucketOwner\":\"$ACCOUNT_ID\",
-        \"SourceBucket\":\"arn:aws:s3:::$SRC_BUCKET\",
-        \"Filter\": {\"ObjectReplicationStatuses\":[\"NONE\"]}
-      }
-    }" \
+    \"S3JobManifestGenerator\": {
+      \"ExpectedBucketOwner\": \"$ACCOUNT_ID\",
+      \"SourceBucket\": \"arn:aws:s3:::$SRC_BUCKET\",
+      \"Filter\": { \"ObjectReplicationStatuses\": [\"NONE\"] },
+      \"ManifestOutputLocation\": {
+        \"ExpectedManifestBucketOwner\": \"$ACCOUNT_ID\",
+        \"Bucket\": \"arn:aws:s3:::$DST_BUCKET\",
+        \"ManifestPrefix\": \"$MANIFEST_PREFIX\",
+        \"ManifestFormat\": \"S3InventoryReport_CSV_20211130\"
+      },
+      \"EnableManifestOutput\": true
+    }
+  }" \
   --report "{
-      \"Bucket\":\"arn:aws:s3:::$DST_BUCKET\",
-      \"Format\":\"Report_CSV_20180820\",
-      \"Enabled\":true,
-      \"Prefix\":\"$REPORT_PREFIX\",
-      \"ReportScope\":\"AllTasks\"
-    }"
+    \"Bucket\": \"arn:aws:s3:::$DST_BUCKET\",
+    \"Format\": \"Report_CSV_20180820\",
+    \"Enabled\": true,
+    \"Prefix\": \"$REPORT_PREFIX\",
+    \"ReportScope\": \"AllTasks\"
+  }"
