@@ -5,9 +5,9 @@ variable "replication_role_name" {
   default = "s3-replication-role" 
   }
 variable "replication_storage_class" {
-   type = string 
-   default = "STANDARD" 
-   }
+  type = string 
+  default = "STANDARD" 
+  }
 
 variable "enable_batch_replication" { 
   type = bool   
