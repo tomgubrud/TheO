@@ -6,6 +6,8 @@ resource "aws_s3_bucket_replication_configuration" "this" {
     id     = "default"
     status = "Enabled"
 
+    filter {}
+
     destination {
       bucket        = local.dst_bucket_arn
       storage_class = var.replication_storage_class

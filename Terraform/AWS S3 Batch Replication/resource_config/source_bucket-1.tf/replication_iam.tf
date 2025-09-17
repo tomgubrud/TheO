@@ -29,7 +29,11 @@ data "aws_iam_policy_document" "replication_permissions" {
     actions = [
       "s3:GetReplicationConfiguration",
       "s3:ListBucket",
-      "s3:GetBucketVersioning"
+      "s3:GetBucketVersioning",
+      "s3:PutInventoryConfiguration",
+      "s3:GetInventoryConfiguration",
+      "s3:ListBucketVersions",
+      "s3:GetBucketLocation"
     ]
     resources = [local.src_bucket_arn]
   }
@@ -43,12 +47,6 @@ data "aws_iam_policy_document" "replication_permissions" {
       "s3:GetObjectVersionForReplication",
       "s3:GetObjectLegalHold",
       "s3:GetObjectRetention",
-      "s3:PutInventoryConfiguration",
-      "s3:GetInventoryConfiguration",
-      "s3:ListBucket",
-      "s3:ListBucketVersions",
-      "s3:GetBucketLocation",
-      "s3:GetBucketVersioning"
     ]
     resources = ["${local.src_bucket_arn}/*"]
   }
