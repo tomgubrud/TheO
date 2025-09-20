@@ -41,3 +41,28 @@ for a in "${args[@]}"; do
 done
 
 echo "[DONE] Numbered $count files into $OUTDIR/ (open these in VS Code and screenshot)."
+
+
+
+
+1: output
+"id" {
+2:
+3: value
+alcription = *Tement (concat (ack-53_bucket.base_bucket.*. id), 0)
+4:
+｝
+5:
+6: output "name" {
+7: description = "Name of the s3 bucket."
+8: value
+= element (concat (aws_s3_bucket.base_bucket.*
+•id), 0)
+9：｝
+10:
+11: output "arn" {
+12: description = "Arn of s3 bucket."
+13: value
+= element (concat (aws_s3_bucket.base_bucket.*
+•arn), 0)
+14：｝
