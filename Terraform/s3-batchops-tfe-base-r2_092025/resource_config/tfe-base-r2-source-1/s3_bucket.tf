@@ -1,13 +1,13 @@
 # Uses locals from terraform/locals.tf: app_code, env_number, region, cost_tracking_tags
 
-module "tom_src_base_kms_policy" {
+module "src_base_kms_policy" {
   source = "git::https://github.crit.theocc.net/platform-engineering-org/tf-modules-base.git//aws/security/kms/occ_base_kms_key_policy?ref=v14"
 }
 
-module "tom_src_kms_key" {
+module "src_kms_key" {
   source             = "git::https://github.crit.theocc.net/platform-engineering-org/tf-modules-base.git//aws/security/kms/kms_key?ref=v14"
-  key_label          = "tom-tfe-base-r2-source-1-kms"
-  policy             = module.tom_src_base_kms_policy.policy
+  key_label          = "tfe-base-r2-source-1-kms"
+  policy             = module.src_base_kms_policy.policy
   app_code           = local.app_code
   env_number         = local.env_number
   region             = local.region
@@ -16,8 +16,8 @@ module "tom_src_kms_key" {
 
 module "tom_source_bucket" {
   source                   = "git::https://github.crit.theocc.net/platform-engineering-org/tf-modules-base.git//aws/storage/s3_bucket_r2?ref=v14"
-  bucket_name              = "tom-tfe-base-r2-source-1"
-  kms_key_arn              = module.tom_src_kms_key.key_arn
+  bucket_name              = "tfe-base-r2-source-1"
+  kms_key_arn              = module.src_kms_key.key_arn
   create_bucket_versioning = true
   app_code                 = local.app_code
   env_number               = local.env_number
