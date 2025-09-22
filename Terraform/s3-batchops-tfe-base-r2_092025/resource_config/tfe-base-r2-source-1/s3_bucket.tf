@@ -14,7 +14,7 @@ module "src_kms_key" {
   cost_tracking_tags = local.cost_tracking_tags
 }
 
-module "tom_source_bucket" {
+module "source_bucket" {
   source                   = "git::https://github.crit.theocc.net/platform-engineering-org/tf-modules-base.git//aws/storage/s3_bucket_r2?ref=v14"
   bucket_name              = "tfe-base-r2-source-1"
   kms_key_arn              = module.src_kms_key.key_arn
