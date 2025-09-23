@@ -1,135 +1,94 @@
-#############################################
-# S3 Batch Operations (auto-manifest)
-#############################################
+resource "null_resource" "create_job" {
+  count = var.enable_batch_copy ? 1 : 0
 
-data "aws_caller_identity" "current" {}
-
-# ----- inputs (same names you already use) -----
-variable "app_code"                { type = string }
-variable "env_number"              { type = number }
-variable "source_bucket_arn"       { type = string }
-variable "source_kms_key_arn"      { type = string }
-variable "destination_bucket_arn"  { type = string }
-variable "destination_kms_key_arn" { type = string }
-
-# Optional job label for uniqueness/readability
-variable "purpose"                 { 
-  type = string  
-  default = "backfill" 
+  triggers = {
+    job_id               = local.job_id
+    account_id           = local.account_id
+    region               = local.region
+    role_arn             = aws_iam_role.batch_ops_role.arn
+    source_bucket_arn    = var.source_bucket_arn
+    dest_bucket_arn      = var.destination_bucket_arn
+    dest_kms_key_arn     = var.destination_kms_key_arn
+    report_prefix        = local.report_prefix
+    manifest_prefix      = local.manifest_prefix
+    job_priority         = tostring(var.job_priority)
   }
 
-locals {
-  batchops_id = "${var.app_code}-${var.env_number}-batchops-${var.purpose}"
-  src_objs    = "${var.source_bucket_arn}/*"
-  dst_objs    = "${var.destination_bucket_arn}/*"
-}
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-lc"]
+    command = <<-EOT
+      set -euo pipefail
 
-# ----- IAM role for Batch Ops -----
-data "aws_iam_policy_document" "assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals { 
-      type = "Service" 
-      identifiers = ["batchoperations.s3.amazonaws.com"] 
-      }
-  }
-}
+      JOB="${local.job_id}"
+      ACCOUNT="${local.account_id}"
+      REGION="${local.region}"
+      ROLE="${aws_iam_role.batch_ops_role.arn}"
 
-resource "aws_iam_role" "batch_ops" {
-  name               = substr("${local.batchops_id}-role", 0, 64)
-  assume_role_policy = data.aws_iam_policy_document.assume.json
-  description        = "S3 Batch Ops role for ${local.batchops_id}"
-}
+      SRC="${var.source_bucket_arn}"
+      DST="${var.destination_bucket_arn}"
+      DKMS="${var.destination_kms_key_arn}"
+      REPORT_PREFIX="${local.report_prefix}"
+      MANIFEST_PREFIX="${local.manifest_prefix}"
+      PRIORITY=${var.job_priority}
 
-data "aws_iam_policy_document" "policy" {
-  statement { # read source objects
-    actions   = ["s3:ListBucket"]
-    resources = [var.source_bucket_arn]
-  }
-  statement {
-    actions   = ["s3:GetObject","s3:GetObjectVersion"]
-    resources = [local.src_objs]
-  }
-  statement { # decrypt source KMS
-    actions   = ["kms:Decrypt"]
-    resources = [var.source_kms_key_arn]
-  }
-  statement { # write destination objects
-    actions   = ["s3:ListBucket","s3:GetBucketLocation"]
-    resources = [var.destination_bucket_arn]
-  }
-  statement {
-    actions   = ["s3:PutObject","s3:AbortMultipartUpload"]
-    resources = [local.dst_objs]
-  }
-  statement { # encrypt with dest KMS
-    actions   = ["kms:Encrypt","kms:ReEncrypt*","kms:GenerateDataKey*","kms:Decrypt"]
-    resources = [var.destination_kms_key_arn]
-  }
-}
+      # Build JSON payloads into temp files (avoids quoting issues)
+      MGEN_JSON="/tmp/${JOB}-mgen.json"
+      OP_JSON="/tmp/${JOB}-op.json"
+      REP_JSON="/tmp/${JOB}-rep.json"
 
-resource "aws_iam_policy" "policy" {
-  name   = substr("${local.batchops_id}-policy", 0, 128)
-  policy = data.aws_iam_policy_document.policy.json
-}
-
-resource "aws_iam_role_policy_attachment" "attach" {
-  role       = aws_iam_role.batch_ops.name
-  policy_arn = aws_iam_policy.policy.arn
-}
-
-# ----- S3 Batch Ops job (COPY) with auto-manifest -----
-resource "aws_s3control_job" "copy_existing" {
-  account_id             = data.aws_caller_identity.current.account_id
-  description            = "Backfill ${local.batchops_id} from ${var.source_bucket_arn} to ${var.destination_bucket_arn}"
-  priority               = 10
-  role_arn               = aws_iam_role.batch_ops.arn
-  confirmation_required  = true   # create suspended; you confirm to run
-
-  # Auto-generate manifest from the source bucket (no CSV needed)
-  manifest_generator {
-    s3_job_manifest_generator {
-      expected_bucket_owner = data.aws_caller_identity.current.account_id
-      source_bucket         = var.source_bucket_arn
-
-      # Optional filters you can uncomment later:
-      # filter {
-      #   match_any_prefix = [""]                # or ["logs/","data/"]
-      #   created_after    = "2025-01-01T00:00:00Z"
-      #   object_size_greater_than = 0
-      # }
-
-      enable_manifest_output = true
-
-      manifest_output_location {
-        expected_manifest_bucket_owner = data.aws_caller_identity.current.account_id
-        bucket  = var.destination_bucket_arn
-        prefix  = "batchops/manifests/${local.batchops_id}/"
-        manifest_encryption { 
-          sse_kms { key_id = var.destination_kms_key_arn } 
-          }
-        manifest_format = "S3InventoryReport_CSV_20211130"
-      }
+      cat > "${MGEN_JSON}" <<JSON
+{
+  "S3JobManifestGenerator": {
+    "ExpectedBucketOwner": "${ACCOUNT}",
+    "SourceBucket": "${SRC}",
+    "EnableManifestOutput": true,
+    "ManifestOutputLocation": {
+      "Bucket": "${DST}",
+      "ManifestPrefix": "${MANIFEST_PREFIX}/${JOB}",
+      "ManifestEncryption": { "SSEKMS": { "KeyId": "${DKMS}" } },
+      "ManifestFormat": "S3InventoryReport_CSV_20211130"
     }
   }
+}
+JSON
 
-  operation {
-    s3_put_object_copy {
-      target_resource     = var.destination_bucket_arn
-      metadata_directive  = "COPY"
-      storage_class       = "STANDARD"
-      sse_kms_encryption { key_id = var.destination_kms_key_arn }
-    }
-  }
-
-  report {
-    bucket       = var.destination_bucket_arn
-    prefix       = "batchops/reports/${local.batchops_id}/"
-    format       = "Report_CSV_20180820"
-    enabled      = true
-    report_scope = "AllTasks"
+      cat > "${OP_JSON}" <<JSON
+{
+  "S3PutObjectCopy": {
+    "TargetResource": "${DST}",
+    "CannedAccessControlList": "bucket-owner-full-control",
+    "SSEAwsKmsKeyId": "${DKMS}"
   }
 }
+JSON
 
-output "job_id"   { value = aws_s3control_job.copy_existing.id }
-output "role_arn" { value = aws_iam_role.batch_ops.arn }
+      cat > "${REP_JSON}" <<JSON
+{
+  "Bucket": "${DST}",
+  "Prefix": "${REPORT_PREFIX}",
+  "Format": "Report_CSV_20180820",
+  "Enabled": true,
+  "ReportScope": "AllTasks"
+}
+JSON
+
+      # Create the job (idempotent via client request token)
+      aws s3control create-job \
+        --region "${REGION}" \
+        --account-id "${ACCOUNT}" \
+        --no-confirmation-required \
+        --priority "${PRIORITY}" \
+        --description "${var.purpose} ${JOB}" \
+        --client-request-token "${JOB}" \
+        --role-arn "${ROLE}" \
+        --manifest-generator "file://${MGEN_JSON}" \
+        --operation "file://${OP_JSON}" \
+        --report "file://${REP_JSON}" \
+      || echo "Job may already exist for token ${JOB}; continuing."
+
+      rm -f "${MGEN_JSON}" "${OP_JSON}" "${REP_JSON}"
+    EOT
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.attach]
+}

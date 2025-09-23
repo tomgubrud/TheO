@@ -1,8 +1,14 @@
-locals {
-  acct_id  = data.aws_caller_identity.current.account_id
-  job_name = "tfe-${var.app_code}-${var.env_number}-batchops-${var.purpose}"
+data "aws_caller_identity" "current" {}
 
-  # deterministic token unless caller passes one
-  crt      = coalesce(var.client_request_token,
-              md5(join("|", [var.source_bucket_arn, var.destination_bucket_arn, var.purpose])))
+data "aws_region" "current" {}
+
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  region     = data.aws_region.current.name
+
+  # stable, idempotent client token / job id
+  job_id = "${var.app_code}-${tostring(var.env_number)}-${var.purpose}-batch"
+
+  manifest_prefix = var.manifest_prefix
+  report_prefix   = var.report_prefix
 }

@@ -1,41 +1,58 @@
-variable "app_code"                 { type = string }
-variable "env_number"               { type = number }
-variable "purpose"                  { 
-    type = string 
-default = "backfill" 
-} # shows up in names/descriptions
+variable "purpose" {
+  description = "Short purpose tag for the job id/description (e.g., seed-copy)."
+  type        = string
+}
 
-variable "source_bucket_arn"        { type = string }
-variable "source_kms_key_arn"       { type = string }
-variable "destination_bucket_arn"   { type = string }
-variable "destination_kms_key_arn"  { type = string }
+variable "app_code" {
+  description = "2–3 char code for the app."
+  type        = string
+}
 
-# When false: only the IAM role/policy are created. Flip to true to create & start the Batch Ops job.
-variable "enable_batch_ops"         { 
-    type = bool    
-    default = false 
-    }
+variable "env_number" {
+  description = "Numeric environment number (1–99)."
+  type        = number
+}
 
-# Optional: narrow what gets copied (leave empty to copy everything)
-variable "prefixes"                 { 
-    type = list(string) 
-    default = [] 
-    }
+variable "source_bucket_arn" {
+  type        = string
+  description = "ARN of the SOURCE bucket."
+}
 
-# Optional: job priority (1..priority ceiling)
-variable "priority"                 { 
-    type = number  
-    default = 10 
-    }
+variable "source_kms_key_arn" {
+  type        = string
+  description = "ARN of the SOURCE bucket KMS key."
+}
 
-# Optional: write reports to this prefix in the destination bucket
-variable "report_prefix"            { 
-    type = string  
-    default = "batchops/report" 
-    }
+variable "destination_bucket_arn" {
+  type        = string
+  description = "ARN of the DESTINATION bucket."
+}
 
-# Optional: unique token; keeps job creation idempotent per (source,dest,purpose)
-variable "client_request_token" {
-  type    = string
-  default = null
+variable "destination_kms_key_arn" {
+  type        = string
+  description = "ARN of the DESTINATION bucket KMS key."
+}
+
+variable "enable_batch_copy" {
+  description = "When true, create/run the S3 Batch Operations job."
+  type        = bool
+  default     = false
+}
+
+variable "job_priority" {
+  description = "S3 Batch Operations priority (higher runs sooner)."
+  type        = number
+  default     = 10
+}
+
+variable "manifest_prefix" {
+  description = "Prefix (in destination bucket) for the auto-generated manifest."
+  type        = string
+  default     = "_batchops/manifests"
+}
+
+variable "report_prefix" {
+  description = "Prefix (in destination bucket) for the job reports."
+  type        = string
+  default     = "_batchops/reports"
 }
