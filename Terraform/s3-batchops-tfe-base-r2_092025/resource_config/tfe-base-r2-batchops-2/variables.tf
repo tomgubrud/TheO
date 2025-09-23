@@ -1,33 +1,18 @@
-variable "app_code"        { type = string }
-variable "env_number"      { type = number }
-variable "region"          { type = string }
+variable "app_code"            { type = string }
+variable "env_number"          { type = number }
+variable "region"              { type = string }
+variable "purpose"             { type = string, default = "S3 Batch copy of existing objects (initial sync)" }
 
-# Human-readable purpose/description for the job (appears in the console)
-variable "purpose"         { type = string }
+variable "source_bucket_arn"        { type = string }
+variable "destination_bucket_arn"   { type = string }
+variable "source_kms_key_arn"       { type = string }
+variable "destination_kms_key_arn"  { type = string }
 
-# ARNs from your two bucket modules
-variable "source_bucket_arn"       { type = string }
-variable "source_kms_key_arn"      { type = string }
-variable "destination_bucket_arn"  { type = string }
-variable "destination_kms_key_arn" { type = string }
+# Optional prefixes written by AWS (no need to pre-create)
+variable "manifest_prefix"     { type = string, default = "batch/manifests/" }
+variable "report_prefix"       { type = string, default = "batch/reports/" }
 
-# Toggle to actually create the Batch Ops job
-variable "enable_batch_copy" { 
-type = bool
-default = false 
-}
+variable "job_priority"        { type = number, default = 10 }
 
-# Optional knobs
-variable "priority"      {
-     type = number
-     default = 10 
-     } # 0-99 (0 highest)
-variable "manifest_prefix" {
-    type = string
-    default = null
-}
-
-variable "report_prefix" { 
-    type = string
-    default = "batchops" 
-    }
+# Toggle to actually create/submit the job
+variable "enable_batch_copy"   { type = bool,   default = false }
