@@ -190,19 +190,31 @@ resource "aws_s3_bucket_policy" "destination_updated" {
 }
 
 # ---------- Fetch and update destination KMS key policy ----------
-data "external" "kms_policy" {
-  program = ["bash", "-c", <<-EOT
-    policy=$(aws kms get-key-policy \
-      --key-id ${var.destination_kms_key_arn} \
-      --policy-name default \
-      --output text)
-    echo "$policy" | jq -c '{policy: .}'
-  EOT
-  ]
+# First, fetch the existing KMS policy and save it to a file
+resource "null_resource" "fetch_kms_policy" {
+  triggers = {
+    key_arn = var.destination_kms_key_arn
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws kms get-key-policy \
+        --key-id ${var.destination_kms_key_arn} \
+        --policy-name default \
+        --output text > /tmp/${local.job_name}-existing-kms-policy.json
+    EOT
+  }
+}
+
+# Read the existing policy
+data "local_file" "existing_kms_policy" {
+  filename = "/tmp/${local.job_name}-existing-kms-policy.json"
+  
+  depends_on = [null_resource.fetch_kms_policy]
 }
 
 locals {
-  existing_kms_policy = jsondecode(data.external.kms_policy.result.policy)
+  existing_kms_policy = jsondecode(data.local_file.existing_kms_policy.content)
   
   batch_kms_statement = {
     Sid    = "AllowS3BatchOperations"
@@ -248,7 +260,10 @@ POLICY
     EOT
   }
   
-  depends_on = [aws_iam_role.batch_role]
+  depends_on = [
+    aws_iam_role.batch_role,
+    data.local_file.existing_kms_policy
+  ]
 }
 
 # ---------- Generate manifest ----------
