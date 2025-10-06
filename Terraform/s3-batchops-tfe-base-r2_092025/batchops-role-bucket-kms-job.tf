@@ -206,39 +206,58 @@ check_aws_cli() {
     echo "AWS CLI is already installed"
     return 0
   else
-    echo "AWS CLI not found, installing..."
+    echo "AWS CLI not found, installing locally..."
     return 1
   fi
 }
 
-# Install AWS CLI if not present
+# Install AWS CLI locally without sudo if not present
 if ! check_aws_cli; then
-  echo "Installing AWS CLI v2..."
+  echo "Installing AWS CLI v2 to local directory..."
   
-  # Detect OS
+  # Create local bin directory
+  mkdir -p $HOME/.local/bin
+  mkdir -p /tmp/aws-cli-install
+  
+  # Detect OS and install
   if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     # Linux installation
-    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
-    cd /tmp
+    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/aws-cli-install/awscliv2.zip"
+    cd /tmp/aws-cli-install
     unzip -q awscliv2.zip
-    sudo ./aws/install --update || ./aws/install --update
-    rm -rf /tmp/awscliv2.zip /tmp/aws
+    
+    # Install to local directory without sudo
+    ./aws/install --install-dir $HOME/.local/aws-cli --bin-dir $HOME/.local/bin
+    
+    # Add to PATH for this session
+    export PATH="$HOME/.local/bin:$PATH"
+    
   elif [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS installation
-    curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "/tmp/AWSCLIV2.pkg"
-    sudo installer -pkg /tmp/AWSCLIV2.pkg -target /
-    rm /tmp/AWSCLIV2.pkg
+    # macOS - try local install
+    curl -s "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "/tmp/aws-cli-install/AWSCLIV2.pkg"
+    cd /tmp/aws-cli-install
+    pkgutil --expand AWSCLIV2.pkg expanded
+    tar -xzf expanded/aws-cli.pkg/Payload -C $HOME/.local/
+    ln -sf $HOME/.local/aws-cli/aws $HOME/.local/bin/aws
+    ln -sf $HOME/.local/aws-cli/aws_completer $HOME/.local/bin/aws_completer
+    export PATH="$HOME/.local/bin:$PATH"
   else
     echo "Unsupported OS for automatic AWS CLI installation"
     exit 1
   fi
   
-  echo "AWS CLI installed successfully"
+  # Cleanup
+  rm -rf /tmp/aws-cli-install
+  
+  echo "AWS CLI installed successfully to $HOME/.local/bin"
 fi
+
+# Ensure AWS CLI is in PATH
+export PATH="$HOME/.local/bin:$PATH"
 
 # Verify AWS CLI is now available
 if ! command -v aws &> /dev/null; then
-  echo "Error: AWS CLI installation failed"
+  echo "Error: AWS CLI installation failed or not in PATH"
   exit 1
 fi
 
@@ -248,6 +267,12 @@ EXISTING_POLICY=$(aws kms get-key-policy \
   --key-id ${var.destination_kms_key_arn} \
   --policy-name default \
   --output text)
+
+# Check if the batch operations statement already exists
+if echo "$EXISTING_POLICY" | grep -q "AllowS3BatchOperations"; then
+  echo "Batch operations statement already exists in KMS policy, skipping update"
+  exit 0
+fi
 
 # Parse and update the policy
 echo "Updating KMS policy..."
@@ -265,14 +290,15 @@ UPDATED_POLICY=$(echo "$EXISTING_POLICY" | jq --argjson newstmt '{
     "kms:DescribeKey"
   ],
   "Resource": "*"
-}' '.Statement += [$newstmt]')
+}' '. + {Statement: (.Statement + [$newstmt])}')
 
 # Save updated policy to file
-cat > /tmp/${local.job_name}-kms-policy.json <<POLICY
+cat > /tmp/${local.job_name}-kms-policy.json <<'POLICY'
 $UPDATED_POLICY
 POLICY
 
 # Apply the updated policy
+echo "Applying updated KMS policy..."
 aws kms put-key-policy \
   --key-id ${var.destination_kms_key_arn} \
   --policy-name default \
