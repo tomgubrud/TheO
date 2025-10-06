@@ -190,12 +190,19 @@ resource "aws_s3_bucket_policy" "destination_updated" {
 }
 
 # ---------- Fetch existing destination KMS key policy ----------
-data "aws_kms_key" "destination" {
-  key_id = var.destination_kms_key_arn
+data "external" "kms_policy" {
+  program = ["bash", "-c", <<-EOT
+    aws kms get-key-policy \
+      --key-id ${var.destination_kms_key_arn} \
+      --policy-name default \
+      --query Policy \
+      --output text | jq -R -s '{policy: .}'
+  EOT
+  ]
 }
 
 locals {
-  existing_kms_policy = jsondecode(data.aws_kms_key.destination.policy)
+  existing_kms_policy = jsondecode(data.external.kms_policy.result.policy)
   
   batch_kms_statement = {
     Sid    = "AllowS3BatchOperations"
@@ -206,7 +213,8 @@ locals {
     Action = [
       "kms:Encrypt",
       "kms:Decrypt",
-      "kms:GenerateDataKey*",
+      "kms:GenerateDataKey",
+      "kms:GenerateDataKeyWithoutPlaintext",
       "kms:DescribeKey"
     ]
     Resource = "*"
@@ -219,13 +227,23 @@ locals {
 }
 
 # ---------- Update destination KMS key policy ----------
-resource "aws_kms_key_policy" "destination_updated" {
-  key_id = var.destination_kms_key_arn
-  
-  policy = jsonencode({
-    Version = local.existing_kms_policy.Version
-    Statement = local.updated_kms_statements
-  })
+resource "null_resource" "update_kms_policy" {
+  triggers = {
+    role_arn    = aws_iam_role.batch_role.arn
+    policy_hash = md5(jsonencode(local.updated_kms_statements))
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws kms put-key-policy \
+        --key-id ${var.destination_kms_key_arn} \
+        --policy-name default \
+        --policy '${jsonencode({
+          Version = local.existing_kms_policy.Version
+          Statement = local.updated_kms_statements
+        })}'
+    EOT
+  }
   
   depends_on = [aws_iam_role.batch_role]
 }
