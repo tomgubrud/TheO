@@ -192,11 +192,11 @@ resource "aws_s3_bucket_policy" "destination_updated" {
 # ---------- Fetch and update destination KMS key policy ----------
 data "external" "kms_policy" {
   program = ["bash", "-c", <<-EOT
-    aws kms get-key-policy \
+    policy=$(aws kms get-key-policy \
       --key-id ${var.destination_kms_key_arn} \
       --policy-name default \
-      --query Policy \
-      --output text | jq -R -s '{policy: .}'
+      --output text)
+    echo "$policy" | jq -c '{policy: .}'
   EOT
   ]
 }
@@ -234,13 +234,17 @@ resource "null_resource" "update_kms_policy" {
 
   provisioner "local-exec" {
     command = <<-EOT
+      cat > /tmp/${local.job_name}-kms-policy.json <<'POLICY'
+${jsonencode({
+  Version = local.existing_kms_policy.Version
+  Statement = local.updated_kms_statements
+})}
+POLICY
+
       aws kms put-key-policy \
         --key-id ${var.destination_kms_key_arn} \
         --policy-name default \
-        --policy '${jsonencode({
-          Version = local.existing_kms_policy.Version
-          Statement = local.updated_kms_statements
-        })}'
+        --policy file:///tmp/${local.job_name}-kms-policy.json
     EOT
   }
   
