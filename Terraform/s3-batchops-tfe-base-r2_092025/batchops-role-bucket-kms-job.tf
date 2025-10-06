@@ -55,35 +55,72 @@ resource "aws_iam_policy" "batch_policy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # Read from source bucket and objects
       {
         Effect   = "Allow"
         Action   = [
           "s3:GetObject",
           "s3:GetObjectVersion",
-          "s3:GetObjectTagging",
+          "s3:GetObjectVersionAcl",
           "s3:GetObjectVersionTagging",
-          "s3:ListBucket"
+          "s3:GetObjectRetention",
+          "s3:GetObjectLegalHold",
+          "s3:GetObjectVersionForReplication",
+          "s3:GetObjectAcl",
+          "s3:GetObjectTagging",
+          "s3:ListBucket",
+          "s3:ListBucketVersions"
         ]
         Resource = [
           var.source_bucket_arn,
           "${var.source_bucket_arn}/*"
         ]
       },
+      # Source bucket replication configuration
+      {
+        Effect   = "Allow"
+        Action   = [
+          "s3:GetReplicationConfiguration",
+          "s3:GetBucketVersioning",
+          "s3:GetBucketLocation"
+        ]
+        Resource = var.source_bucket_arn
+      },
+      # Write to destination bucket and objects
       {
         Effect   = "Allow"
         Action   = [
           "s3:PutObject",
           "s3:PutObjectAcl",
+          "s3:PutObjectVersionAcl",
           "s3:PutObjectTagging",
+          "s3:PutObjectVersionTagging",
+          "s3:ReplicateObject",
+          "s3:ReplicateDelete",
+          "s3:ReplicateTags",
+          "s3:GetObjectVersionForReplication",
+          "s3:ObjectOwnerOverrideToBucketOwner",
           "s3:AbortMultipartUpload",
+          "s3:ListMultipartUploadParts",
           "s3:ListBucket",
-          "s3:GetBucketLocation"
+          "s3:ListBucketVersions"
         ]
         Resource = [
           var.destination_bucket_arn,
           "${var.destination_bucket_arn}/*"
         ]
       },
+      # Destination bucket configuration
+      {
+        Effect   = "Allow"
+        Action   = [
+          "s3:GetBucketVersioning",
+          "s3:GetBucketLocation",
+          "s3:GetBucketObjectLockConfiguration"
+        ]
+        Resource = var.destination_bucket_arn
+      },
+      # KMS decrypt on source
       {
         Effect   = "Allow"
         Action   = [
@@ -92,11 +129,13 @@ resource "aws_iam_policy" "batch_policy" {
         ]
         Resource = var.source_kms_key_arn
       },
+      # KMS encrypt on destination
       {
         Effect   = "Allow"
         Action   = [
           "kms:Encrypt",
-          "kms:GenerateDataKey*",
+          "kms:GenerateDataKey",
+          "kms:GenerateDataKeyWithoutPlaintext",
           "kms:DescribeKey"
         ]
         Resource = var.destination_kms_key_arn
@@ -239,15 +278,20 @@ resource "local_file" "batch_operation" {
   filename = local.op_json
   content = jsonencode({
     S3PutObjectCopy = {
-      TargetResource                 = var.destination_bucket_arn
-      CannedAccessControlList        = var.destination_acl
-      StorageClass                   = var.destination_storage_class
-      TargetKeyPrefix                = var.destination_prefix
-      SSEAwsKmsKeyId                 = var.destination_kms_key_arn
-      BucketKeyEnabled               = true
-      ObjectLockLegalHoldStatus      = "OFF"
-      ObjectLockMode                 = "COMPLIANCE"
-      UnModifiedSinceConstraint      = null
+      TargetResource          = var.destination_bucket_arn
+      StorageClass            = var.destination_storage_class
+      TargetKeyPrefix         = var.destination_prefix
+      SSEAwsKmsKeyId          = var.destination_kms_key_arn
+      BucketKeyEnabled        = true
+      MetadataDirective       = "COPY"
+      AccessControlGrants     = null
+      CannedAccessControlList = null
+      ModifiedSinceConstraint = null
+      NewObjectMetadata       = null
+      NewObjectTagging        = []
+      RedirectLocation        = null
+      RequesterPays           = false
+      UnModifiedSinceConstraint = null
     }
   })
 
