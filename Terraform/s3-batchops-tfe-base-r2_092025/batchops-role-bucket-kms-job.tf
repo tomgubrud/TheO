@@ -189,7 +189,7 @@ resource "aws_s3_bucket_policy" "destination_updated" {
   depends_on = [aws_iam_role.batch_role]
 }
 
-# ---------- Fetch existing destination KMS key policy ----------
+# ---------- Fetch and update destination KMS key policy ----------
 data "external" "kms_policy" {
   program = ["bash", "-c", <<-EOT
     aws kms get-key-policy \
@@ -226,7 +226,6 @@ locals {
   )
 }
 
-# ---------- Update destination KMS key policy ----------
 resource "null_resource" "update_kms_policy" {
   triggers = {
     role_arn    = aws_iam_role.batch_role.arn
@@ -248,16 +247,7 @@ resource "null_resource" "update_kms_policy" {
   depends_on = [aws_iam_role.batch_role]
 }
 
-# ---------- Generate manifest JSON for S3 Batch Operations ----------
-resource "local_file" "manifest" {
-  filename = local.mgen_json
-  content = jsonencode({
-    Bucket = local.src_bucket_name
-    Format = "S3InventoryReport_CSV_20211130"
-  })
-}
-
-# ---------- Create S3 Batch Operations Job ----------
+# ---------- Generate manifest ----------
 resource "null_resource" "create_manifest" {
   triggers = {
     always_run = timestamp()
@@ -287,11 +277,11 @@ resource "null_resource" "create_manifest" {
   depends_on = [
     aws_iam_role_policy_attachment.attach,
     aws_s3_bucket_policy.destination_updated,
-    aws_kms_key_policy.destination_updated
+    null_resource.update_kms_policy
   ]
 }
 
-# ---------- Create the batch operation specification ----------
+# ---------- Create batch operation specification ----------
 resource "local_file" "batch_operation" {
   filename = local.op_json
   content = jsonencode({
