@@ -189,81 +189,103 @@ resource "aws_s3_bucket_policy" "destination_updated" {
   depends_on = [aws_iam_role.batch_role]
 }
 
-# ---------- Fetch and update destination KMS key policy ----------
-# First, fetch the existing KMS policy and save it to a file
-resource "null_resource" "fetch_kms_policy" {
-  triggers = {
-    key_arn = var.destination_kms_key_arn
-  }
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      aws kms get-key-policy \
-        --key-id ${var.destination_kms_key_arn} \
-        --policy-name default \
-        --output text > /tmp/${local.job_name}-existing-kms-policy.json
-    EOT
-  }
-}
-
-# Read the existing policy
-data "local_file" "existing_kms_policy" {
-  filename = "/tmp/${local.job_name}-existing-kms-policy.json"
-  
-  depends_on = [null_resource.fetch_kms_policy]
-}
-
-locals {
-  existing_kms_policy = jsondecode(data.local_file.existing_kms_policy.content)
-  
-  batch_kms_statement = {
-    Sid    = "AllowS3BatchOperations"
-    Effect = "Allow"
-    Principal = {
-      AWS = aws_iam_role.batch_role.arn
-    }
-    Action = [
-      "kms:Encrypt",
-      "kms:Decrypt",
-      "kms:GenerateDataKey",
-      "kms:GenerateDataKeyWithoutPlaintext",
-      "kms:DescribeKey"
-    ]
-    Resource = "*"
-  }
-  
-  updated_kms_statements = concat(
-    local.existing_kms_policy.Statement,
-    [local.batch_kms_statement]
-  )
-}
-
+# ---------- Update destination KMS key policy ----------
 resource "null_resource" "update_kms_policy" {
   triggers = {
-    role_arn    = aws_iam_role.batch_role.arn
-    policy_hash = md5(jsonencode(local.updated_kms_statements))
+    role_arn = aws_iam_role.batch_role.arn
   }
 
   provisioner "local-exec" {
     command = <<-EOT
-      cat > /tmp/${local.job_name}-kms-policy.json <<'POLICY'
-${jsonencode({
-  Version = local.existing_kms_policy.Version
-  Statement = local.updated_kms_statements
-})}
+#!/bin/bash
+set -e
+
+# Function to check if AWS CLI is installed
+check_aws_cli() {
+  if command -v aws &> /dev/null; then
+    echo "AWS CLI is already installed"
+    return 0
+  else
+    echo "AWS CLI not found, installing..."
+    return 1
+  fi
+}
+
+# Install AWS CLI if not present
+if ! check_aws_cli; then
+  echo "Installing AWS CLI v2..."
+  
+  # Detect OS
+  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    # Linux installation
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+    cd /tmp
+    unzip -q awscliv2.zip
+    sudo ./aws/install --update || ./aws/install --update
+    rm -rf /tmp/awscliv2.zip /tmp/aws
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS installation
+    curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "/tmp/AWSCLIV2.pkg"
+    sudo installer -pkg /tmp/AWSCLIV2.pkg -target /
+    rm /tmp/AWSCLIV2.pkg
+  else
+    echo "Unsupported OS for automatic AWS CLI installation"
+    exit 1
+  fi
+  
+  echo "AWS CLI installed successfully"
+fi
+
+# Verify AWS CLI is now available
+if ! command -v aws &> /dev/null; then
+  echo "Error: AWS CLI installation failed"
+  exit 1
+fi
+
+# Fetch existing KMS policy
+echo "Fetching existing KMS policy..."
+EXISTING_POLICY=$(aws kms get-key-policy \
+  --key-id ${var.destination_kms_key_arn} \
+  --policy-name default \
+  --output text)
+
+# Parse and update the policy
+echo "Updating KMS policy..."
+UPDATED_POLICY=$(echo "$EXISTING_POLICY" | jq --argjson newstmt '{
+  "Sid": "AllowS3BatchOperations",
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "${aws_iam_role.batch_role.arn}"
+  },
+  "Action": [
+    "kms:Encrypt",
+    "kms:Decrypt",
+    "kms:GenerateDataKey",
+    "kms:GenerateDataKeyWithoutPlaintext",
+    "kms:DescribeKey"
+  ],
+  "Resource": "*"
+}' '.Statement += [$newstmt]')
+
+# Save updated policy to file
+cat > /tmp/${local.job_name}-kms-policy.json <<POLICY
+$UPDATED_POLICY
 POLICY
 
-      aws kms put-key-policy \
-        --key-id ${var.destination_kms_key_arn} \
-        --policy-name default \
-        --policy file:///tmp/${local.job_name}-kms-policy.json
-    EOT
+# Apply the updated policy
+aws kms put-key-policy \
+  --key-id ${var.destination_kms_key_arn} \
+  --policy-name default \
+  --policy file:///tmp/${local.job_name}-kms-policy.json
+
+echo "KMS policy updated successfully!"
+rm -f /tmp/${local.job_name}-kms-policy.json
+EOT
+
+    interpreter = ["bash", "-c"]
   }
   
-  depends_on = [
-    aws_iam_role.batch_role,
-    data.local_file.existing_kms_policy
-  ]
+  depends_on = [aws_iam_role.batch_role]
 }
 
 # ---------- Generate manifest ----------
