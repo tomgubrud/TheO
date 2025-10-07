@@ -15,9 +15,21 @@ echo "==========================================================================
 # Check for input file
 if [[ -f "testinput" ]]; then
     echo "Reading configuration from testinput file..."
-    SOURCE_BUCKET=$(sed -n '1p' testinput)
-    DEST_BUCKET=$(sed -n '2p' testinput)
-    SOURCE_PREFIX=$(sed -n '3p' testinput)
+    
+    # Check if comma-separated or newline-separated
+    if grep -q ',' testinput; then
+        IFS=',' read -r SOURCE_BUCKET DEST_BUCKET SOURCE_PREFIX < testinput
+    else
+        SOURCE_BUCKET=$(sed -n '1p' testinput)
+        DEST_BUCKET=$(sed -n '2p' testinput)
+        SOURCE_PREFIX=$(sed -n '3p' testinput)
+    fi
+    
+    # Trim whitespace
+    SOURCE_BUCKET=$(echo "$SOURCE_BUCKET" | xargs)
+    DEST_BUCKET=$(echo "$DEST_BUCKET" | xargs)
+    SOURCE_PREFIX=$(echo "$SOURCE_PREFIX" | xargs)
+    
     echo "Loaded: Source=$SOURCE_BUCKET, Dest=$DEST_BUCKET, Prefix=$SOURCE_PREFIX"
 else
     read -p "Source bucket name: " SOURCE_BUCKET
