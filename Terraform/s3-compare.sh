@@ -12,9 +12,18 @@ echo "==========================================================================
 echo "S3 Bucket Object Count Comparison Tool"
 echo "================================================================================"
 
-read -p "Source bucket name: " SOURCE_BUCKET
-read -p "Destination bucket name: " DEST_BUCKET
-read -p "Source prefix to check (press Enter for entire bucket): " SOURCE_PREFIX
+# Check for input file
+if [[ -f "testinput" ]]; then
+    echo "Reading configuration from testinput file..."
+    SOURCE_BUCKET=$(sed -n '1p' testinput)
+    DEST_BUCKET=$(sed -n '2p' testinput)
+    SOURCE_PREFIX=$(sed -n '3p' testinput)
+    echo "Loaded: Source=$SOURCE_BUCKET, Dest=$DEST_BUCKET, Prefix=$SOURCE_PREFIX"
+else
+    read -p "Source bucket name: " SOURCE_BUCKET
+    read -p "Destination bucket name: " DEST_BUCKET
+    read -p "Source prefix to check (press Enter for entire bucket): " SOURCE_PREFIX
+fi
 
 if [[ -n "$SOURCE_PREFIX" ]] && [[ "$SOURCE_PREFIX" != */ ]]; then
     SOURCE_PREFIX="${SOURCE_PREFIX}/"
