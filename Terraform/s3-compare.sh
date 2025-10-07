@@ -60,12 +60,20 @@ get_prefixes() {
     local bucket=$1
     local prefix=$2
     
-    aws s3api list-objects-v2 \
+    echo "DEBUG: Running list-objects-v2 on bucket=$bucket prefix=$prefix" >&2
+    
+    local result=$(aws s3api list-objects-v2 \
         --bucket "$bucket" \
         --prefix "$prefix" \
         --delimiter "/" \
         --query 'CommonPrefixes[].Prefix' \
-        --output text 2>/dev/null | tr '\t' '\n'
+        --output text 2>&1)
+    
+    echo "DEBUG: Result=$result" >&2
+    
+    if [[ -n "$result" && "$result" != "None" ]]; then
+        echo "$result" | tr '\t' '\n'
+    fi
 }
 
 # Function to count objects for a prefix
@@ -85,15 +93,23 @@ count_objects() {
 # Get prefixes
 echo "Getting prefixes from source bucket..."
 SOURCE_PREFIXES=$(get_prefixes "$SOURCE_BUCKET" "$SOURCE_PREFIX")
+echo "DEBUG: Source prefixes found:"
+echo "$SOURCE_PREFIXES"
+echo ""
 
 if [[ -z "$SOURCE_PREFIXES" ]]; then
+    echo "No subprefixes found, using main prefix: $SOURCE_PREFIX"
     SOURCE_PREFIXES="$SOURCE_PREFIX"
 fi
 
 echo "Getting prefixes from destination bucket..."
 DEST_PREFIXES=$(get_prefixes "$DEST_BUCKET" "$SOURCE_PREFIX")
+echo "DEBUG: Dest prefixes found:"
+echo "$DEST_PREFIXES"
+echo ""
 
 if [[ -z "$DEST_PREFIXES" ]]; then
+    echo "No subprefixes found, using main prefix: $SOURCE_PREFIX"
     DEST_PREFIXES="$SOURCE_PREFIX"
 fi
 
