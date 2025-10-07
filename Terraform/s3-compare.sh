@@ -101,29 +101,49 @@ declare -A dest_counts
 total_prefixes=$(echo "$ALL_PREFIXES" | wc -l)
 current=0
 
+# Create temp files for parallel processing
+tmpdir=$(mktemp -d)
+trap "rm -rf $tmpdir" EXIT
+
 while IFS= read -r prefix; do
     [[ -z "$prefix" ]] && continue
     
     ((current++))
-    echo "[$current/$total_prefixes] Processing: $prefix"
     
-    # Count in parallel for this prefix
-    src_count=$(count_objects "$SOURCE_BUCKET" "$prefix") &
-    src_pid=$!
+    # Launch both counts in background
+    (
+        src=$(count_objects "$SOURCE_BUCKET" "$prefix")
+        echo "$prefix::$src" >> "$tmpdir/source.txt"
+        echo "[$current/$total_prefixes] ✓ Source: $prefix ($src objects)"
+    ) &
     
-    dst_count=$(count_objects "$DEST_BUCKET" "$prefix") &
-    dst_pid=$!
+    (
+        dst=$(count_objects "$DEST_BUCKET" "$prefix")
+        echo "$prefix::$dst" >> "$tmpdir/dest.txt"
+        echo "[$current/$total_prefixes] ✓ Dest: $prefix ($dst objects)"
+    ) &
     
-    wait $src_pid
-    src_count=$(count_objects "$SOURCE_BUCKET" "$prefix")
-    
-    wait $dst_pid
-    dst_count=$(count_objects "$DEST_BUCKET" "$prefix")
-    
-    source_counts["$prefix"]=$src_count
-    dest_counts["$prefix"]=$dst_count
+    # Limit to 10 concurrent prefix pairs (20 total API calls)
+    if ((current % 10 == 0)); then
+        wait
+    fi
     
 done <<< "$ALL_PREFIXES"
+
+# Wait for all remaining jobs
+wait
+
+echo ""
+echo "Parsing results..."
+
+# Read results into arrays
+while IFS='::' read -r prefix count; do
+    source_counts["$prefix"]=$count
+done < "$tmpdir/source.txt"
+
+while IFS='::' read -r prefix count; do
+    dest_counts["$prefix"]=$count
+done < "$tmpdir/dest.txt"
 
 echo ""
 echo "================================================================================"
