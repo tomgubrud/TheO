@@ -1,27 +1,41 @@
 #!/usr/bin/env bash
 # s3_compare_counts.sh — parallel current-object count compare (SRC vs DEST)
-# Prompts for: source bucket, destination bucket, optional prefix
-# Prints only mismatched shards; totals at the end.
+# Usage:
+#   bash s3_compare_counts.sh                # prompts
+#   bash s3_compare_counts.sh SRC DEST [PFX] # non-interactive
 
-set -euo pipefail
+set -uo pipefail
 
-MAX_PROCS="${MAX_PROCS:-$(/usr/bin/getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
+# ---------- config ----------
+MAX_PROCS="${MAX_PROCS:-$({ /usr/bin/getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4; } 2>/dev/null)}"
 
 hr(){ printf '%*s\n' "${1:-80}" '' | tr ' ' '-'; }
-ask(){ local p="$1" v="$2" d="${3:-}"; read -rp "$p${d:+ [$d]}: " "$v"; [[ -z "${!v}" && -n "$d" ]] && eval "$v=\"$d\""; }
 
-# Filesystem-safe ID for shard filenames
+ask(){
+  # robust prompt that won't exit under set -e/-u
+  local prompt="$1" var="$2" default="${3:-}" ans rc
+  while :; do
+    IFS= read -r -p "${prompt}${default:+ [$default]}: " ans; rc=$?
+    if (( rc != 0 )); then
+      # stdin closed; if we have a default use it, else bail clearly
+      if [[ -n "$default" ]]; then eval "$var=\"\$default\""; return 0; fi
+      echo "Input aborted for '$prompt'." >&2; exit 1
+    fi
+    if [[ -z "$ans" && -n "$default" ]]; then eval "$var=\"\$default\""; return 0; fi
+    if [[ -n "$ans" ]]; then eval "$var=\"\$ans\""; return 0; fi
+    echo "Please enter a value."; 
+  done
+}
+
+# filesystem-safe id (avoid / + = newline)
 hash_id(){
-  if command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
-  elif command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$1" | sha256sum | awk '{print $1}'
-  else
-    printf '%s' "$1" | base64 | tr '/+=\n' '_.-_'
+  if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | awk '{print $1}'
+  else printf '%s' "$1" | base64 | tr '/+=\n' '_.-_'
   fi
 }
 
-# Count *current* objects under bucket/prefix via paginated ListObjectsV2
+# count *current* objects via paginated ListObjectsV2
 count_objects(){
   local bucket="$1" prefix="$2" token="" total=0 kc nct
   while :; do
@@ -40,38 +54,42 @@ count_objects(){
   echo "$total"
 }
 
-# Discover immediate child “folders” to shard on
+# discover immediate child "folders"
 discover_children(){
   local bucket="$1" base="$2"
   aws s3api list-objects-v2 --bucket "$bucket" --prefix "$base" --delimiter '/' \
     --query 'CommonPrefixes[].Prefix' --output text 2>/dev/null | tr '\t' '\n' | sed '/^$/d' || true
 }
 
-# Fallback fan-out by first character for flat prefixes
+# fallback: fan-out by first char to parallelize flat trees
 fallback_shards(){
-  local base="$1" chars="0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-=%/"
-  local out=()
-  for ((i=0;i<${#chars};i++)); do out+=("${base}${chars:i:1}"); done
+  local base="$1" chars='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-=%/'
+  local out=(); for ((i=0;i<${#chars};i++)); { out+=("${base}${chars:i:1}"); }
   printf '%s\n' "${out[@]}"
 }
 
+# background worker
 process_shard(){
   local shard="$1" src="$2" dest="$3" tmp="$4"
   local src_cnt dest_cnt fn
-  src_cnt=$(count_objects "$src" "$shard")
-  dest_cnt=$(count_objects "$dest" "$shard")
+  src_cnt="$(count_objects "$src" "$shard")"
+  dest_cnt="$(count_objects "$dest" "$shard")"
   fn="$tmp/$(hash_id "$shard").tsv"
   printf "%s\t%d\t%d\n" "$shard" "$src_cnt" "$dest_cnt" > "$fn"
 }
 
-wait_for_slot(){ while (( $(jobs -r | wc -l | tr -d ' ') >= MAX_PROCS )); do if wait -n 2>/dev/null; then :; else sleep 0.2; fi; done; }
+wait_for_slot(){
+  # cap background jobs
+  while (( $(jobs -r | wc -l | tr -d ' ') >= MAX_PROCS )); do
+    if wait -n 2>/dev/null; then :; else sleep 0.2; fi
+  done
+}
 
-echo "S3 object count comparer (parallel)."
-ask "Source bucket" SRC_BUCKET
-ask "Destination bucket" DEST_BUCKET
-ask "Source prefix (optional, e.g., input/ or input/ods/)" SRC_PREFIX ""
-
-# normalize prefix
+# ---------- args/prompts ----------
+SRC_BUCKET="${1:-}"; DEST_BUCKET="${2:-}"; SRC_PREFIX="${3:-}"
+if [[ -z "$SRC_BUCKET" ]]; then ask "Source bucket" SRC_BUCKET; fi
+if [[ -z "$DEST_BUCKET" ]]; then ask "Destination bucket" DEST_BUCKET; fi
+if [[ -z "$SRC_PREFIX" ]]; then ask "Source prefix (optional, e.g., input/ or input/ods/)" SRC_PREFIX ""; fi
 [[ -n "$SRC_PREFIX" && "${SRC_PREFIX: -1}" != "/" ]] && SRC_PREFIX="${SRC_PREFIX}/"
 
 hr
@@ -80,16 +98,15 @@ echo "Destination: s3://$DEST_BUCKET/${SRC_PREFIX}"
 echo "Concurrency: $MAX_PROCS workers"
 hr
 
+# ---------- build shards ----------
 echo "Discovering child prefixes under s3://$SRC_BUCKET/${SRC_PREFIX} ..."
 mapfile -t SHARDS < <(discover_children "$SRC_BUCKET" "$SRC_PREFIX")
-
-# if few/no children, still parallelize via first-character sharding
 if (( ${#SHARDS[@]} <= 1 )); then
   echo "Few/no child prefixes; using first-character sharding."
   mapfile -t SHARDS < <(fallback_shards "$SRC_PREFIX")
 fi
-
 echo "Shard count: ${#SHARDS[@]} (processing in parallel)"
+
 TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
 
 i=0
@@ -100,9 +117,9 @@ for shard in "${SHARDS[@]}"; do
 done
 wait
 
+# ---------- collate ----------
 MISMATCHES=0; MATCHES=0; TOTAL_SRC=0; TOTAL_DEST=0
 printf "\n"; hr; printf "Mismatched shards (Source vs Dest counts):\n"; hr
-
 for f in "$TMPDIR"/*.tsv; do
   [[ -e "$f" ]] || continue
   IFS=$'\t' read -r shard s_cnt d_cnt < "$f"

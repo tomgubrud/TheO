@@ -30,6 +30,15 @@ if ! command -v aws &> /dev/null; then
     exit 1
 fi
 
+# Source AWS helper script if it exists
+HELPER_SCRIPT="./awshelper.sh"
+if [[ -f "$HELPER_SCRIPT" ]]; then
+    echo "Loading AWS configuration from ${HELPER_SCRIPT}..."
+    source "$HELPER_SCRIPT"
+    echo "AWS configuration loaded."
+    echo ""
+fi
+
 # Check AWS credentials
 if ! aws sts get-caller-identity &> /dev/null; then
     echo "Error: AWS credentials not configured or invalid."
