@@ -43,12 +43,17 @@ echo "==========================================================================
 echo ""
 
 TEMP_DIR=$(mktemp -d)
-trap "rm -rf $TEMP_DIR" EXIT
 
 SOURCE_FILE="${TEMP_DIR}/source_counts.txt"
 DEST_FILE="${TEMP_DIR}/dest_counts.txt"
 SOURCE_PREFIXES="${TEMP_DIR}/source_prefixes.txt"
 DEST_PREFIXES="${TEMP_DIR}/dest_prefixes.txt"
+
+# Cleanup function
+cleanup() {
+    rm -rf "$TEMP_DIR"
+}
+trap cleanup EXIT
 
 # Function to get all prefixes (directories) under a path
 get_prefixes() {
@@ -153,13 +158,17 @@ echo ""
 declare -A source_counts
 declare -A dest_counts
 
-while IFS='::' read -r prefix count; do
-    source_counts["$prefix"]=$count
-done < "$SOURCE_FILE"
+if [[ -f "$SOURCE_FILE" ]]; then
+    while IFS='::' read -r prefix count; do
+        [[ -n "$prefix" ]] && source_counts["$prefix"]=$count
+    done < "$SOURCE_FILE"
+fi
 
-while IFS='::' read -r prefix count; do
-    dest_counts["$prefix"]=$count
-done < "$DEST_FILE"
+if [[ -f "$DEST_FILE" ]]; then
+    while IFS='::' read -r prefix count; do
+        [[ -n "$prefix" ]] && dest_counts["$prefix"]=$count
+    done < "$DEST_FILE"
+fi
 
 # Get all unique prefixes
 all_prefixes=$(printf '%s\n' "${!source_counts[@]}" "${!dest_counts[@]}" | sort -u)
