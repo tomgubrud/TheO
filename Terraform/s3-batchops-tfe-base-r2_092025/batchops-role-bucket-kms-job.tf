@@ -261,11 +261,15 @@ if ! command -v aws &> /dev/null; then
   exit 1
 fi
 
+# Set AWS region from Terraform
+export AWS_DEFAULT_REGION="${data.aws_region.current.name}"
+
 # Fetch existing KMS policy
 echo "Fetching existing KMS policy..."
 EXISTING_POLICY=$(aws kms get-key-policy \
   --key-id ${var.destination_kms_key_arn} \
   --policy-name default \
+  --region ${data.aws_region.current.name} \
   --output text)
 
 # Check if the batch operations statement already exists
@@ -302,6 +306,7 @@ echo "Applying updated KMS policy..."
 aws kms put-key-policy \
   --key-id ${var.destination_kms_key_arn} \
   --policy-name default \
+  --region ${data.aws_region.current.name} \
   --policy file:///tmp/${local.job_name}-kms-policy.json
 
 echo "KMS policy updated successfully!"
