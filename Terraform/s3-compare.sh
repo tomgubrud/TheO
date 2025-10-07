@@ -137,13 +137,20 @@ echo ""
 echo "Parsing results..."
 
 # Read results into arrays
-while IFS='::' read -r prefix count; do
-    source_counts["$prefix"]=$count
-done < "$tmpdir/source.txt"
+if [[ -f "$tmpdir/source.txt" ]]; then
+    while IFS='::' read -r prefix count; do
+        [[ -n "$prefix" ]] && source_counts["$prefix"]=$count
+    done < "$tmpdir/source.txt"
+fi
 
-while IFS='::' read -r prefix count; do
-    dest_counts["$prefix"]=$count
-done < "$tmpdir/dest.txt"
+if [[ -f "$tmpdir/dest.txt" ]]; then
+    while IFS='::' read -r prefix count; do
+        [[ -n "$prefix" ]] && dest_counts["$prefix"]=$count
+    done < "$tmpdir/dest.txt"
+fi
+
+echo "Source prefixes found: ${#source_counts[@]}"
+echo "Dest prefixes found: ${#dest_counts[@]}"
 
 echo ""
 echo "================================================================================"
