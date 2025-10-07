@@ -67,25 +67,190 @@ echo "Comparing: ${SOURCE_BUCKET}/${SOURCE_PREFIX} -> ${DEST_BUCKET}/${SOURCE_PR
 echo "================================================================================"
 echo ""
 
-# Function to get all top-level prefixes
-get_prefixes() {
+# Function to get all prefixes recursively
+get_all_prefixes() {
     local bucket=$1
     local prefix=$2
+    local found_prefixes=()
     
-    echo "DEBUG: Running list-objects-v2 on bucket=$bucket prefix=$prefix" >&2
-    
-    local result=$(aws s3api list-objects-v2 \
+    # Get immediate child prefixes
+    local children=$(aws s3api list-objects-v2 \
         --bucket "$bucket" \
         --prefix "$prefix" \
         --delimiter "/" \
         --query 'CommonPrefixes[].Prefix' \
         --output text 2>&1)
     
-    echo "DEBUG: Result=$result" >&2
+    if [[ -n "$children" && "$children" != "None" && "$children" != *"error"* && "$children" != *"Error"* ]]; then
+        # Process each child prefix
+        while IFS=
+
+# Function to count objects for a prefix
+count_objects() {
+    local bucket=$1
+    local prefix=$2
     
-    if [[ -n "$result" && "$result" != "None" ]]; then
-        echo "$result" | tr '\t' '\n'
+    local count=$(aws s3api list-objects-v2 \
+        --bucket "$bucket" \
+        --prefix "$prefix" \
+        --query 'length(Contents)' \
+        --output text 2>/dev/null)
+    
+    echo "${count:-0}"
+}
+
+# Get prefixes
+echo "Getting prefixes from source bucket..."
+SOURCE_PREFIXES=$(get_prefixes "$SOURCE_BUCKET" "$SOURCE_PREFIX")
+echo "DEBUG: Source prefixes found:"
+echo "$SOURCE_PREFIXES"
+echo ""
+
+if [[ -z "$SOURCE_PREFIXES" ]]; then
+    echo "No subprefixes found, using main prefix: $SOURCE_PREFIX"
+    SOURCE_PREFIXES="$SOURCE_PREFIX"
+fi
+
+echo "Getting prefixes from destination bucket..."
+DEST_PREFIXES=$(get_prefixes "$DEST_BUCKET" "$SOURCE_PREFIX")
+echo "DEBUG: Dest prefixes found:"
+echo "$DEST_PREFIXES"
+echo ""
+
+if [[ -z "$DEST_PREFIXES" ]]; then
+    echo "No subprefixes found, using main prefix: $SOURCE_PREFIX"
+    DEST_PREFIXES="$SOURCE_PREFIX"
+fi
+
+# Combine and deduplicate all prefixes
+ALL_PREFIXES=$(echo -e "${SOURCE_PREFIXES}\n${DEST_PREFIXES}" | sort -u)
+
+echo ""
+echo "Counting objects..."
+echo ""
+
+# Debug: show what prefixes we found
+echo "DEBUG: Prefixes to process:"
+echo "$ALL_PREFIXES"
+echo ""
+
+declare -A source_counts
+declare -A dest_counts
+
+total_prefixes=$(echo "$ALL_PREFIXES" | grep -c .)
+current=0
+
+echo "Total prefixes to process: $total_prefixes"
+echo ""
+
+# Process each prefix
+while IFS= read -r prefix; do
+    [[ -z "$prefix" ]] && continue
+    
+    ((current++))
+    echo "[$current/$total_prefixes] Processing: $prefix"
+    
+    src=$(count_objects "$SOURCE_BUCKET" "$prefix")
+    echo "  Source count: $src"
+    
+    dst=$(count_objects "$DEST_BUCKET" "$prefix")
+    echo "  Dest count: $dst"
+    
+    source_counts["$prefix"]=$src
+    dest_counts["$prefix"]=$dst
+    
+done <<< "$ALL_PREFIXES"
+
+echo ""
+echo "Counts collected: ${#source_counts[@]} prefixes"
+
+echo ""
+echo "================================================================================"
+echo "RESULTS"
+echo "================================================================================"
+echo ""
+
+matches=0
+mismatches=0
+total_source=0
+total_dest=0
+
+declare -a mismatch_list
+
+while IFS= read -r prefix; do
+    [[ -z "$prefix" ]] && continue
+    
+    src=${source_counts[$prefix]:-0}
+    dst=${dest_counts[$prefix]:-0}
+    
+    ((total_source += src))
+    ((total_dest += dst))
+    
+    if [[ $src -ne $dst ]]; then
+        mismatch_list+=("$prefix::$src::$dst")
+        ((mismatches++))
+    else
+        ((matches++))
     fi
+done <<< "$ALL_PREFIXES"
+
+if [[ $mismatches -gt 0 ]]; then
+    echo -e "${RED}MISMATCHED PREFIXES:${NC}"
+    echo "--------------------------------------------------------------------------------"
+    printf "%-60s %-15s %-15s\n" "Prefix" "Source" "Destination"
+    echo "--------------------------------------------------------------------------------"
+    
+    for item in "${mismatch_list[@]}"; do
+        IFS='::' read -r prefix src dst <<< "$item"
+        printf "%-60s %-15s %-15s\n" "$prefix" "$src" "$dst"
+    done
+    
+    echo ""
+    echo -e "Total mismatches: ${RED}${mismatches}${NC}"
+else
+    echo -e "${GREEN}✓ No mismatches found!${NC}"
+fi
+
+echo ""
+echo "Matching prefixes: ${matches}"
+
+echo ""
+echo "================================================================================"
+printf "Total objects in %s/%s: %s\n" "$SOURCE_BUCKET" "$SOURCE_PREFIX" "$total_source"
+printf "Total objects in %s/%s: %s\n" "$DEST_BUCKET" "$SOURCE_PREFIX" "$total_dest"
+printf "Difference: %s\n" "$((total_source > total_dest ? total_source - total_dest : total_dest - total_source))"
+echo "================================================================================"
+echo ""
+\t' read -r child; do
+            [[ -z "$child" ]] && continue
+            found_prefixes+=("$child")
+            
+            # Recursively get children of this prefix
+            local subprefixes=$(get_all_prefixes "$bucket" "$child")
+            if [[ -n "$subprefixes" ]]; then
+                while IFS= read -r subprefix; do
+                    [[ -n "$subprefix" ]] && found_prefixes+=("$subprefix")
+                done <<< "$subprefixes"
+            fi
+        done <<< "$children"
+    fi
+    
+    # If no children found, return the prefix itself (leaf node)
+    if [[ ${#found_prefixes[@]} -eq 0 ]]; then
+        echo "$prefix"
+    else
+        printf '%s\n' "${found_prefixes[@]}"
+    fi
+}
+
+# Function to get all top-level prefixes
+get_prefixes() {
+    local bucket=$1
+    local prefix=$2
+    
+    echo "DEBUG: Getting all prefixes recursively from bucket=$bucket prefix=$prefix" >&2
+    
+    get_all_prefixes "$bucket" "$prefix"
 }
 
 # Function to count objects for a prefix
