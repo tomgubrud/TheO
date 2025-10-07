@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
-# s3_compare_counts.sh — parallel current-object count compare (SRC vs DEST)
+# bucketcompare.sh — parallel current-object count compare (SRC vs DEST)
 # Usage:
-#   bash s3_compare_counts.sh                # prompts
-#   bash s3_compare_counts.sh SRC DEST [PFX] # non-interactive
+#   ./bucketcompare.sh                       # prompts
+#   ./bucketcompare.sh SRC_BUCKET DEST_BUCKET [PREFIX]  # no prompts
+#
+# Optional helper: ./awshelper.sh (sourced if present) — can export defaults like:
+#   export SRC_DEFAULT=in2-sdp-encore-s3-bucket-ncz
+#   export DEST_DEFAULT=nc-dev-00-aog-data-sdp-s3-encore
+#   export PREFIX_DEFAULT=input/
+#   export AWS_PROFILE=...
+#   export AWS_REGION=...
 
-set -uo pipefail
+set -euo pipefail
+
+# ---------- helper (optional) ----------
+HELPER_SCRIPT="./awshelper.sh"
+if [[ -f "$HELPER_SCRIPT" ]]; then
+  echo "Loading AWS configuration from ${HELPER_SCRIPT}..."
+  # shellcheck source=/dev/null
+  source "$HELPER_SCRIPT"
+  echo "AWS configuration loaded."
+  echo
+fi
 
 # ---------- config ----------
 MAX_PROCS="${MAX_PROCS:-$({ /usr/bin/getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4; } 2>/dev/null)}"
@@ -17,17 +34,15 @@ ask(){
   while :; do
     IFS= read -r -p "${prompt}${default:+ [$default]}: " ans; rc=$?
     if (( rc != 0 )); then
-      # stdin closed; if we have a default use it, else bail clearly
       if [[ -n "$default" ]]; then eval "$var=\"\$default\""; return 0; fi
       echo "Input aborted for '$prompt'." >&2; exit 1
     fi
     if [[ -z "$ans" && -n "$default" ]]; then eval "$var=\"\$default\""; return 0; fi
     if [[ -n "$ans" ]]; then eval "$var=\"\$ans\""; return 0; fi
-    echo "Please enter a value."; 
+    echo "Please enter a value."
   done
 }
 
-# filesystem-safe id (avoid / + = newline)
 hash_id(){
   if command -v shasum >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
   elif command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | awk '{print $1}'
@@ -35,7 +50,6 @@ hash_id(){
   fi
 }
 
-# count *current* objects via paginated ListObjectsV2
 count_objects(){
   local bucket="$1" prefix="$2" token="" total=0 kc nct
   while :; do
@@ -54,21 +68,18 @@ count_objects(){
   echo "$total"
 }
 
-# discover immediate child "folders"
 discover_children(){
   local bucket="$1" base="$2"
   aws s3api list-objects-v2 --bucket "$bucket" --prefix "$base" --delimiter '/' \
     --query 'CommonPrefixes[].Prefix' --output text 2>/dev/null | tr '\t' '\n' | sed '/^$/d' || true
 }
 
-# fallback: fan-out by first char to parallelize flat trees
 fallback_shards(){
   local base="$1" chars='0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-=%/'
   local out=(); for ((i=0;i<${#chars};i++)); { out+=("${base}${chars:i:1}"); }
   printf '%s\n' "${out[@]}"
 }
 
-# background worker
 process_shard(){
   local shard="$1" src="$2" dest="$3" tmp="$4"
   local src_cnt dest_cnt fn
@@ -79,17 +90,19 @@ process_shard(){
 }
 
 wait_for_slot(){
-  # cap background jobs
   while (( $(jobs -r | wc -l | tr -d ' ') >= MAX_PROCS )); do
     if wait -n 2>/dev/null; then :; else sleep 0.2; fi
   done
 }
 
-# ---------- args/prompts ----------
-SRC_BUCKET="${1:-}"; DEST_BUCKET="${2:-}"; SRC_PREFIX="${3:-}"
-if [[ -z "$SRC_BUCKET" ]]; then ask "Source bucket" SRC_BUCKET; fi
-if [[ -z "$DEST_BUCKET" ]]; then ask "Destination bucket" DEST_BUCKET; fi
-if [[ -z "$SRC_PREFIX" ]]; then ask "Source prefix (optional, e.g., input/ or input/ods/)" SRC_PREFIX ""; fi
+# ---------- args + prompts ----------
+SRC_BUCKET="${1:-${SRC_DEFAULT-}}"
+DEST_BUCKET="${2:-${DEST_DEFAULT-}}"
+SRC_PREFIX="${3:-${PREFIX_DEFAULT-}}"
+
+if [[ -z "${SRC_BUCKET:-}" ]];  then ask "Source bucket" SRC_BUCKET;  fi
+if [[ -z "${DEST_BUCKET:-}" ]]; then ask "Destination bucket" DEST_BUCKET; fi
+if [[ -z "${SRC_PREFIX:-}" ]]; then ask "Source prefix (optional, e.g., input/ or input/ods/)" SRC_PREFIX ""; fi
 [[ -n "$SRC_PREFIX" && "${SRC_PREFIX: -1}" != "/" ]] && SRC_PREFIX="${SRC_PREFIX}/"
 
 hr
@@ -98,7 +111,7 @@ echo "Destination: s3://$DEST_BUCKET/${SRC_PREFIX}"
 echo "Concurrency: $MAX_PROCS workers"
 hr
 
-# ---------- build shards ----------
+# ---------- shard & run ----------
 echo "Discovering child prefixes under s3://$SRC_BUCKET/${SRC_PREFIX} ..."
 mapfile -t SHARDS < <(discover_children "$SRC_BUCKET" "$SRC_PREFIX")
 if (( ${#SHARDS[@]} <= 1 )); then

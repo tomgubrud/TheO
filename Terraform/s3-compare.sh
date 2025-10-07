@@ -111,32 +111,40 @@ count_all_parallel() {
     local count=0
     local total=$(wc -l < "$prefix_file")
     
-    # Process prefixes in parallel (max 20 at a time)
-    export -f count_objects
-    export bucket
-    
-    cat "$prefix_file" | parallel -j 20 --line-buffer --tagstring '{}' \
-        "echo {}::\$(count_objects $bucket {})" >> "$output_file" 2>/dev/null || {
+    # Check if parallel command exists
+    if command -v parallel &> /dev/null; then
+        # Process prefixes in parallel using GNU parallel
+        export -f count_objects
+        cat "$prefix_file" | parallel -j 20 "echo {}::\$(count_objects $bucket {})" >> "$output_file"
+    else
         # Fallback if parallel not available - do sequential with background jobs
         echo "Warning: 'parallel' command not found, using slower sequential processing..."
+        local temp_out="${output_file}.tmp"
+        > "$temp_out"
+        
         while IFS= read -r pfx; do
             (
                 cnt=$(count_objects "$bucket" "$pfx")
-                echo "${pfx}::${cnt}" >> "$output_file"
+                flock -x "$temp_out" -c "echo '${pfx}::${cnt}' >> '$temp_out'"
             ) &
             
             # Limit to 20 concurrent jobs
-            if [[ $(jobs -r -p | wc -l) -ge 20 ]]; then
+            while [[ $(jobs -r -p | wc -l) -ge 20 ]]; do
                 wait -n
-            fi
+            done
             
             ((count++))
             if ((count % 10 == 0)) || ((count == total)); then
                 echo "  Progress: ${count}/${total} prefixes counted"
             fi
         done < "$prefix_file"
+        
+        # Wait for all background jobs to complete
         wait
-    }
+        
+        # Move temp file to final location
+        mv "$temp_out" "$output_file"
+    fi
     
     echo "Completed counting ${bucket}"
 }
