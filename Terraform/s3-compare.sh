@@ -95,62 +95,40 @@ echo ""
 echo "Counting objects..."
 echo ""
 
+# Debug: show what prefixes we found
+echo "DEBUG: Prefixes to process:"
+echo "$ALL_PREFIXES"
+echo ""
+
 declare -A source_counts
 declare -A dest_counts
 
-total_prefixes=$(echo "$ALL_PREFIXES" | wc -l)
+total_prefixes=$(echo "$ALL_PREFIXES" | grep -c .)
 current=0
 
-# Create temp files for parallel processing
-tmpdir=$(mktemp -d)
-trap "rm -rf $tmpdir" EXIT
+echo "Total prefixes to process: $total_prefixes"
+echo ""
 
+# Process each prefix
 while IFS= read -r prefix; do
     [[ -z "$prefix" ]] && continue
     
     ((current++))
+    echo "[$current/$total_prefixes] Processing: $prefix"
     
-    # Launch both counts in background
-    (
-        src=$(count_objects "$SOURCE_BUCKET" "$prefix")
-        echo "$prefix::$src" >> "$tmpdir/source.txt"
-        echo "[$current/$total_prefixes] ✓ Source: $prefix ($src objects)"
-    ) &
+    src=$(count_objects "$SOURCE_BUCKET" "$prefix")
+    echo "  Source count: $src"
     
-    (
-        dst=$(count_objects "$DEST_BUCKET" "$prefix")
-        echo "$prefix::$dst" >> "$tmpdir/dest.txt"
-        echo "[$current/$total_prefixes] ✓ Dest: $prefix ($dst objects)"
-    ) &
+    dst=$(count_objects "$DEST_BUCKET" "$prefix")
+    echo "  Dest count: $dst"
     
-    # Limit to 10 concurrent prefix pairs (20 total API calls)
-    if ((current % 10 == 0)); then
-        wait
-    fi
+    source_counts["$prefix"]=$src
+    dest_counts["$prefix"]=$dst
     
 done <<< "$ALL_PREFIXES"
 
-# Wait for all remaining jobs
-wait
-
 echo ""
-echo "Parsing results..."
-
-# Read results into arrays
-if [[ -f "$tmpdir/source.txt" ]]; then
-    while IFS='::' read -r prefix count; do
-        [[ -n "$prefix" ]] && source_counts["$prefix"]=$count
-    done < "$tmpdir/source.txt"
-fi
-
-if [[ -f "$tmpdir/dest.txt" ]]; then
-    while IFS='::' read -r prefix count; do
-        [[ -n "$prefix" ]] && dest_counts["$prefix"]=$count
-    done < "$tmpdir/dest.txt"
-fi
-
-echo "Source prefixes found: ${#source_counts[@]}"
-echo "Dest prefixes found: ${#dest_counts[@]}"
+echo "Counts collected: ${#source_counts[@]} prefixes"
 
 echo ""
 echo "================================================================================"
