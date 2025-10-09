@@ -1,0 +1,11 @@
+Summary
+Implement a Sentinel policy to ensure all EBS volumes include the correct DLM Backup Tag configuration.
+Context
+To maintain compliance and operational consistency, all EBS volumes must carry the required DLM Backup tag. Missing or incorrect tagging could result in unmanaged snapshots or policy enforcement failures.
+Acceptance Criteria
+Sentinel policy must validate that EBS volumes include the ZoneGroupID tag.
+The ZoneGroupID tag must have a valid value according to approved mappings (e.g., crit, InfraZone:CZ).
+Volumes without the required tag or with invalid tag values must be flagged as noncompliant.
+Policy should produce a clear, actionable error message when violations occur.
+Other Information
+Tag examples and allowed values are available in
