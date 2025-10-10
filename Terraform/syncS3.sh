@@ -167,3 +167,76 @@ duration=$((end_ts - start_ts))
 } | tee "$SUM_LOG"
 
 exit "$sync_rc"
+
+
+# --- Helpers (robust, never exit on errors) ----------------------------------
+COUNT_TIMEOUT="${COUNT_TIMEOUT:-15m}"   # override: COUNT_TIMEOUT=5m ./syncs3.sh
+have_timeout=1
+command -v timeout >/dev/null 2>&1 || have_timeout=0
+
+_run_with_timeout() {
+  # _run_with_timeout <seconds|Xm> <cmd...>
+  # Uses timeout if available, else runs the command directly.
+  local to="$1"; shift
+  if [[ $have_timeout -eq 1 ]]; then
+    timeout "$to" "$@"
+  else
+    "$@"
+  fi
+}
+
+safe_total_bytes() {
+  # Prints total bytes at URI or 0; logs errors to ERR_LOG via global tee.
+  local uri="$1"
+  local out rc
+  set +e
+  out=$(_run_with_timeout "$COUNT_TIMEOUT" aws s3 ls "$uri" --recursive --summarize 2>&1)
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    echo "[prep] WARN: total-bytes failed for $uri (rc=$rc): ${out//$'\n'/ }"
+    echo 0
+    return 0
+  fi
+  local b
+  b=$(awk '/Total Size:/ {print $3}' <<<"$out" | tail -n1)
+  echo "${b:-0}"
+}
+
+safe_obj_count() {
+  # Prints total objects at URI or 0; logs errors to ERR_LOG via global tee.
+  local uri="$1"
+  local out rc
+  set +e
+  out=$(_run_with_timeout "$COUNT_TIMEOUT" aws s3 ls "$uri" --recursive --summarize 2>&1)
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    echo "[prep] WARN: object-count failed for $uri (rc=$rc): ${out//$'\n'/ }"
+    echo 0
+    return 0
+  fi
+  local n
+  n=$(awk '/Total Objects:/ {print $3}' <<<"$out" | tail -n1)
+  echo "${n:-0}"
+}
+
+# --- Pre-counts --------------------------------------------------------------
+echo "[prep] Collecting pre-run object counts... (eventual consistency applies)"
+
+# Quick sanity so we see credential issues immediately
+echo "[prep] aws --version: $(aws --version 2>&1)"
+set +e
+aws sts get-caller-identity >/dev/null 2>&1
+id_rc=$?
+set -e
+if [[ $id_rc -ne 0 ]]; then
+  echo "[prep] WARN: 'aws sts get-caller-identity' failed (rc=$id_rc). Check AWS creds/region."
+fi
+
+src_before_objs="$(safe_obj_count "$SRC_URI")"
+dst_before_objs="$(safe_obj_count "$DST_URI")"
+echo "[prep] Source objects (pre): $src_before_objs"
+echo "[prep] Dest objects (pre):   $dst_before_objs"
+
+start_ts=$(date +%s)
