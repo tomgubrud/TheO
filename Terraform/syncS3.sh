@@ -1,3 +1,4 @@
+cat > syncs3.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,12 +7,25 @@ set -euo pipefail
 # Purpose:
 #   Long-running S3 sync wrapped with vault_keepalive.sh.
 #   Provides:
-#     - live rate tracker (prints every 60s)
-#     - progress CSV (timestamp,total_bytes,delta_bytes,mb_per_sec)
+#     - per-minute progress CSV (timestamp,total_bytes,delta_bytes,mb_per_sec)
+#     - live console speedometer (optionally colored; enable with COLOR=1)
 #     - object-level failure CSV (key,error)
-#     - failure prefix breakdown + summary
+#     - failure prefix breakdown
+#     - end-of-run summary
 #
-# Requires: awshelper.sh, vault_keepalive.sh, .vault_creds.env
+# Requires (in same dir):
+#   - awshelper.sh         (sets AWS tuning, and SRC/DST/BASE vars)
+#   - vault_keepalive.sh   (keeps Vault token + lease alive via .vault_creds.env)
+#   - .vault_creds.env     (used by vault_keepalive.sh)
+#
+# Outputs (default LOG_DIR=./logs):
+#   - sync_<id>.log            (full stdout)
+#   - sync_<id>.err.log        (stderr/errors)
+#   - sync_<id>.progress.csv   (per-minute progress)
+#   - sync_<id>.failures.csv   (object-level failures)
+#   - sync_<id>.failkeys.txt   (unique failed URIs; helper)
+#   - sync_<id>.failprefix.txt (failures grouped by prefix)
+#   - sync_<id>.summary.txt    (final summary)
 # -----------------------------------------------------------------------------
 
 LOG_DIR="${LOG_DIR:-./logs}"
@@ -26,15 +40,15 @@ FAIL_CSV="$LOG_DIR/sync_${RUN_ID}.failures.csv"
 FAIL_KEYS="$LOG_DIR/sync_${RUN_ID}.failkeys.txt"
 FAIL_PREFIX="$LOG_DIR/sync_${RUN_ID}.failprefix.txt"
 
+# Log everything from this script
 exec > >(tee -a "$FULL_LOG") 2> >(tee -a "$ERR_LOG" >&2)
+echo "[init] Logs -> full=$FULL_LOG  errors=$ERR_LOG  progress=$PROG_CSV  failures=$FAIL_CSV"
 
-echo "[init] Logs: $LOG_DIR"
-echo "  full=$FULL_LOG"
-echo "  errors=$ERR_LOG"
-echo "  progress=$PROG_CSV"
-echo "  failures=$FAIL_CSV"
-
-# --- Source helper -----------------------------------------------------------
+# --- Source helper (sets AWS tuning + SRC/DST/BASE) --------------------------
+if [[ ! -f ./awshelper.sh ]]; then
+  echo "ERROR: awshelper.sh not found" >&2; exit 1
+fi
+# shellcheck disable=SC1091
 source ./awshelper.sh
 
 if [[ -z "${SRC:-}" || -z "${DST:-}" || -z "${BASE:-}" ]]; then
@@ -44,199 +58,106 @@ fi
 
 SRC_URI="s3://${SRC}/${BASE}"
 DST_URI="s3://${DST}/${BASE}"
+echo "[init] Source      : $SRC_URI"
+echo "[init] Destination : $DST_URI"
 
+# Helpful AWS envs (resiliency)
 export AWS_PAGER=""
-export AWS_RETRY_MODE=standard
-export AWS_MAX_ATTEMPTS=10
+export AWS_RETRY_MODE="${AWS_RETRY_MODE:-standard}"
+export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
 
 # --- Helpers -----------------------------------------------------------------
+have_timeout=1; command -v timeout >/dev/null 2>&1 || have_timeout=0
+COUNT_TIMEOUT="${COUNT_TIMEOUT:-15m}"
+
+_run_with_timeout() {
+  local to="$1"; shift
+  if [[ $have_timeout -eq 1 ]]; then timeout "$to" "$@"; else "$@"; fi
+}
+
+_safe_ls_summary() {
+  # Echos full summarize text or empty on failure (never exits script)
+  local uri="$1" out rc
+  set +e
+  out=$(_run_with_timeout "$COUNT_TIMEOUT" aws s3 ls "$uri" --recursive --summarize 2>&1)
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    echo "[post] WARN: ls failed for $uri (rc=$rc): ${out//$'\n'/ }" >&2
+    echo ""
+  else
+    echo "$out"
+  fi
+}
+
 safe_total_bytes() {
-  local uri="$1"
-  aws s3 ls "$uri" --recursive --summarize 2>/dev/null |
-    awk '/Total Size:/ {print $3}' | tail -n1 | tr -d '\r' || echo 0
+  local uri="$1" out b
+  out="$(_safe_ls_summary "$uri")"
+  b=$(awk '/Total Size:/ {print $3}' <<<"$out" | tail -n1)
+  [[ -z "$b" ]] && b=0
+  echo "$b"
 }
 
 safe_obj_count() {
-  local uri="$1"
-  aws s3 ls "$uri" --recursive --summarize 2>/dev/null |
-    awk '/Total Objects:/ {print $3}' | tail -n1 | tr -d '\r' || echo 0
+  local uri="$1" out n
+  out="$(_safe_ls_summary "$uri")"
+  n=$(awk '/Total Objects:/ {print $3}' <<<"$out" | tail -n1)
+  [[ -z "$n" ]] && n=0
+  echo "$n"
 }
 
-# --- Pre-counts --------------------------------------------------------------
-echo "[prep] Collecting pre-run counts..."
-src_before_objs=$(safe_obj_count "$SRC_URI")
-dst_before_objs=$(safe_obj_count "$DST_URI")
-echo "[prep] Source objs: $src_before_objs  Dest objs: $dst_before_objs"
-start_ts=$(date +%s)
+human_bytes() {
+  # human_bytes <bytes>
+  local b=$1
+  awk -v b="$b" 'function f(x,u){printf "%.2f %s", x, u}
+    b<1024{f(b,"B");exit}
+    b<1048576{f(b/1024,"KB");exit}
+    b<1073741824{f(b/1048576,"MB");exit}
+    b<1099511627776{f(b/1073741824,"GB");exit}
+    {f(b/1099511627776,"TB")}'
+}
 
-# --- Progress CSV ------------------------------------------------------------
+colorize() {
+  # colorize <rateMBps> <string>
+  if [[ "${COLOR:-0}" -ne 1 ]]; then echo "$2"; return; fi
+  local rate="$1" text="$2"
+  local green; local yellow; local red; local reset
+  green="$(tput setaf 2 2>/dev/null || true)"; yellow="$(tput setaf 3 2>/dev/null || true)"
+  red="$(tput setaf 1 2>/dev/null || true)"; reset="$(tput sgr0 2>/dev/null || true)"
+  # thresholds: >8 MB/s green, 1–8 yellow, <1 red
+  awk -v r="$rate" -v g="$green" -v y="$yellow" -v d="$red" -v z="$reset" -v t="$text" '
+    BEGIN{
+      if (r>8) printf "%s%s%s\n", g,t,z;
+      else if (r>=1) printf "%s%s%s\n", y,t,z;
+      else printf "%s%s%s\n", d,t,z;
+    }'
+}
+
+# --- Progress CSV + speedometer (every 60s) ----------------------------------
 echo "timestamp,total_bytes,delta_bytes,mb_per_sec" >"$PROG_CSV"
 
 progress_loop() {
   local prev_bytes prev_ts now_bytes now_ts delta_b delta_s mbps
-  prev_bytes=$(safe_total_bytes "$DST_URI")
-  prev_ts=$(date +%s)
+  prev_bytes="$(safe_total_bytes "$DST_URI")"
+  prev_ts="$(date +%s)"
   while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 60
-    now_bytes=$(safe_total_bytes "$DST_URI")
-    now_ts=$(date +%s)
-    delta_b=$((now_bytes - prev_bytes))
-    delta_s=$((now_ts - prev_ts))
-    if ((delta_b >= 0 && delta_s > 0)); then
-      mbps=$(awk -v b="$delta_b" -v s="$delta_s" 'BEGIN{printf "%.2f", (b/1048576)/s}')
+    now_bytes="$(safe_total_bytes "$DST_URI")"
+    now_ts="$(date +%s)"
+    delta_b=$(( now_bytes - prev_bytes ))
+    delta_s=$(( now_ts - prev_ts ))
+    if (( delta_b >= 0 && delta_s > 0 )); then
+      mbps=$(awk -v b="$delta_b" -v s="$delta_s" 'BEGIN{printf "%.3f", (b/1048576)/s}')
       printf "%s,%s,%s,%s\n" "$(date -Iseconds)" "$now_bytes" "$delta_b" "$mbps" | tee -a "$PROG_CSV" >/dev/null
     fi
-    prev_bytes=$now_bytes
-    prev_ts=$now_ts
+    prev_bytes="$now_bytes"
+    prev_ts="$now_ts"
   done
 }
 
-# --- Live console speedometer ------------------------------------------------
 display_speedometer() {
   while kill -0 "$SYNC_PID" 2>/dev/null; do
     if [[ -s "$PROG_CSV" ]]; then
-      line=$(tail -n1 "$PROG_CSV")
-      ts=$(cut -d',' -f1 <<<"$line")
-      total=$(cut -d',' -f2 <<<"$line")
-      delta=$(cut -d',' -f3 <<<"$line")
-      rate=$(cut -d',' -f4 <<<"$line")
-      printf "[rate] %s  %'d bytes total  Δ %'d  (%.2f MB/s)\n" "$ts" "$total" "$delta" "$rate"
-    fi
-    sleep 60
-  done
-}
-
-# --- Run sync via vault_keepalive -------------------------------------------
-echo "[run] Starting sync ..."
-set +e
-./vault_keepalive.sh aws s3 sync "$SRC_URI" "$DST_URI" \
-  --exact-timestamps --size-only --no-progress --only-show-errors &
-SYNC_PID=$!
-progress_loop &
-PROG_PID=$!
-display_speedometer &
-SPEED_PID=$!
-
-wait "$SYNC_PID"
-sync_rc=$?
-kill "$PROG_PID" "$SPEED_PID" 2>/dev/null || true
-set -e
-end_ts=$(date +%s)
-
-# --- Post-counts -------------------------------------------------------------
-dst_after_objs=$(safe_obj_count "$DST_URI")
-delta_copied=$((dst_after_objs - dst_before_objs))
-((delta_copied < 0)) && delta_copied=0
-
-# --- Failure parsing ---------------------------------------------------------
-: >"$FAIL_KEYS"
-if [[ -s "$ERR_LOG" ]]; then
-  grep -Eo "s3://[^ ]+" "$ERR_LOG" | grep -E "s3://($SRC|$DST)/" | sort -u >"$FAIL_KEYS"
-fi
-fail_count=0
-[[ -s "$FAIL_KEYS" ]] && fail_count=$(wc -l <"$FAIL_KEYS" | tr -d ' ')
-
-echo "key,error" >"$FAIL_CSV"
-if ((fail_count > 0)); then
-  while IFS= read -r uri; do
-    err_line=$(grep -F "$uri" "$ERR_LOG" | head -n1 | sed 's/"/'\''/g')
-    printf "\"%s\",\"%s\"\n" "$uri" "$err_line" >>"$FAIL_CSV"
-  done <"$FAIL_KEYS"
-fi
-
-# --- Summary -----------------------------------------------------------------
-duration=$((end_ts - start_ts))
-{
-  echo "Run ID: $RUN_ID"
-  echo "Started: $(date -d @"$start_ts" '+%F %T' 2>/dev/null || date -r "$start_ts")"
-  echo "Finished: $(date -d @"$end_ts" '+%F %T' 2>/dev/null || date -r "$end_ts")"
-  echo "Duration (s): $duration"
-  echo "Source: $SRC_URI"
-  echo "Destination: $DST_URI"
-  echo
-  echo "Source objs (pre): $src_before_objs"
-  echo "Dest objs (pre):   $dst_before_objs"
-  echo "Dest objs (post):  $dst_after_objs"
-  echo "Copied/updated:    $delta_copied"
-  echo "Failures:          $fail_count"
-  echo
-  echo "Progress CSV: $PROG_CSV"
-  echo "Failure CSV:  $FAIL_CSV"
-  echo "Logs: $FULL_LOG, $ERR_LOG"
-  echo "Exit code: $sync_rc"
-} | tee "$SUM_LOG"
-
-exit "$sync_rc"
-
-
-# --- Helpers (robust, never exit on errors) ----------------------------------
-COUNT_TIMEOUT="${COUNT_TIMEOUT:-15m}"   # override: COUNT_TIMEOUT=5m ./syncs3.sh
-have_timeout=1
-command -v timeout >/dev/null 2>&1 || have_timeout=0
-
-_run_with_timeout() {
-  # _run_with_timeout <seconds|Xm> <cmd...>
-  # Uses timeout if available, else runs the command directly.
-  local to="$1"; shift
-  if [[ $have_timeout -eq 1 ]]; then
-    timeout "$to" "$@"
-  else
-    "$@"
-  fi
-}
-
-safe_total_bytes() {
-  # Prints total bytes at URI or 0; logs errors to ERR_LOG via global tee.
-  local uri="$1"
-  local out rc
-  set +e
-  out=$(_run_with_timeout "$COUNT_TIMEOUT" aws s3 ls "$uri" --recursive --summarize 2>&1)
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    echo "[prep] WARN: total-bytes failed for $uri (rc=$rc): ${out//$'\n'/ }"
-    echo 0
-    return 0
-  fi
-  local b
-  b=$(awk '/Total Size:/ {print $3}' <<<"$out" | tail -n1)
-  echo "${b:-0}"
-}
-
-safe_obj_count() {
-  # Prints total objects at URI or 0; logs errors to ERR_LOG via global tee.
-  local uri="$1"
-  local out rc
-  set +e
-  out=$(_run_with_timeout "$COUNT_TIMEOUT" aws s3 ls "$uri" --recursive --summarize 2>&1)
-  rc=$?
-  set -e
-  if [[ $rc -ne 0 ]]; then
-    echo "[prep] WARN: object-count failed for $uri (rc=$rc): ${out//$'\n'/ }"
-    echo 0
-    return 0
-  fi
-  local n
-  n=$(awk '/Total Objects:/ {print $3}' <<<"$out" | tail -n1)
-  echo "${n:-0}"
-}
-
-# --- Pre-counts --------------------------------------------------------------
-echo "[prep] Collecting pre-run object counts... (eventual consistency applies)"
-
-# Quick sanity so we see credential issues immediately
-echo "[prep] aws --version: $(aws --version 2>&1)"
-set +e
-aws sts get-caller-identity >/dev/null 2>&1
-id_rc=$?
-set -e
-if [[ $id_rc -ne 0 ]]; then
-  echo "[prep] WARN: 'aws sts get-caller-identity' failed (rc=$id_rc). Check AWS creds/region."
-fi
-
-src_before_objs="$(safe_obj_count "$SRC_URI")"
-dst_before_objs="$(safe_obj_count "$DST_URI")"
-echo "[prep] Source objects (pre): $src_before_objs"
-echo "[prep] Dest objects (pre):   $dst_before_objs"
-
-start_ts=$(date +%s)
+      local line ts total delta rate line_fmt
+      line="$(tail -n1 "$PROG_CSV")"
+      ts="$(
