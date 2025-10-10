@@ -266,3 +266,39 @@ duration=$(( end_ts - ${start_ts:-end_ts} ))
 } | tee "$SUM_LOG"
 
 exit "$sync_rc"
+
+##########################
+
+display_speedometer() {
+  while kill -0 "$SYNC_PID" 2>/dev/null; do
+    if [[ $(wc -l <"$PROG_CSV") -gt 1 ]]; then
+      local line ts total delta rate line_fmt
+      line="$(tail -n1 "$PROG_CSV")"
+      # skip header if tailed
+      if [[ "$line" == timestamp,* ]]; then
+        sleep 5; continue
+      fi
+
+      ts="$(cut -d',' -f1 <<<"$line")"
+      total="$(cut -d',' -f2 <<<"$line")"
+      delta="$(cut -d',' -f3 <<<"$line")"
+      rate="$(cut -d',' -f4 <<<"$line")"
+
+      # Force numeric fallback to 0 if empty/non-numeric
+      [[ "$rate" =~ ^[0-9.]+$ ]] || rate="0"
+      [[ "$total" =~ ^[0-9]+$ ]] || total="0"
+      [[ "$delta" =~ ^[0-9]+$ ]] || delta="0"
+
+      line_fmt=$(printf "[rate] %s  %s total  Δ %s  (%.3f MB/s)" \
+        "$ts" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate")
+
+      # add label when scanning (0 MB/s)
+      if (( $(echo "$rate == 0" | bc -l) )); then
+        line_fmt="$line_fmt  (scanning source)"
+      fi
+
+      colorize "$rate" "$line_fmt"
+    fi
+    sleep 60
+  done
+}
