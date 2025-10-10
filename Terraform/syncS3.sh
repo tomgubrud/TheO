@@ -1,4 +1,3 @@
-cat > syncs3.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -267,5 +266,3 @@ duration=$(( end_ts - ${start_ts:-end_ts} ))
 } | tee "$SUM_LOG"
 
 exit "$sync_rc"
-EOF
-chmod +x syncs3.sh
