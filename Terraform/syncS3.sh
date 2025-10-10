@@ -160,4 +160,112 @@ display_speedometer() {
     if [[ -s "$PROG_CSV" ]]; then
       local line ts total delta rate line_fmt
       line="$(tail -n1 "$PROG_CSV")"
-      ts="$(
+      ts="$(cut -d',' -f1 <<<"$line")"
+      total="$(cut -d',' -f2 <<<"$line")"
+      delta="$(cut -d',' -f3 <<<"$line")"
+      rate="$(cut -d',' -f4 <<<"$line")"
+      line_fmt=$(printf "[rate] %s  %s total  Δ %s  (%s MB/s)" \
+        "$ts" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate")
+      colorize "$rate" "$line_fmt"
+    fi
+    sleep 60
+  done
+}
+
+# --- Run the sync via vault_keepalive ---------------------------------------
+echo "[run ] Starting sync..."
+set +e
+./vault_keepalive.sh aws s3 sync "$SRC_URI" "$DST_URI" \
+  --exact-timestamps --size-only --no-progress --only-show-errors &
+SYNC_PID=$!
+progress_loop &
+PROG_PID=$!
+display_speedometer &
+SPEED_PID=$!
+
+wait "$SYNC_PID"
+sync_rc=$?
+kill "$PROG_PID" "$SPEED_PID" 2>/dev/null || true
+set -e
+end_ts=$(date +%s)
+
+# --- Post-run counts (only counts we need) -----------------------------------
+echo "[post] Collecting post-sync counts..."
+src_after_objs="$(safe_obj_count "$SRC_URI")"
+dst_after_objs="$(safe_obj_count "$DST_URI")"
+echo "[post] Source objs (post): $src_after_objs"
+echo "[post] Dest objs   (post): $dst_after_objs"
+
+# --- Failure parsing ---------------------------------------------------------
+: >"$FAIL_KEYS"
+if [[ -s "$ERR_LOG" ]]; then
+  # Extract s3:// URIs and keep only SRC/DST bucket URIs
+  grep -Eo "s3://[^ ]+" "$ERR_LOG" | grep -E "s3://(${SRC}|${DST})/" | sort -u >"$FAIL_KEYS" || true
+fi
+
+fail_count=0
+[[ -s "$FAIL_KEYS" ]] && fail_count=$(wc -l <"$FAIL_KEYS" | tr -d ' ')
+
+echo "key,error" >"$FAIL_CSV"
+if (( fail_count > 0 )); then
+  while IFS= read -r uri; do
+    err_line="$(grep -F "$uri" "$ERR_LOG" | head -n1 | sed 's/"/'\''/g')"
+    printf "\"%s\",\"%s\"\n" "$uri" "$err_line" >>"$FAIL_CSV"
+  done <"$FAIL_KEYS"
+fi
+
+# Group failures by prefix depth 1–3 (relative to BASE)
+: >"$FAIL_PREFIX"
+if (( fail_count > 0 )); then
+  rel_tmp="$LOG_DIR/sync_${RUN_ID}.failkeys.rel.txt"
+  awk -v src="s3://${SRC}/" -v dst="s3://${DST}/" -v base="${BASE%/}/" '
+    {
+      uri=$0
+      sub(src,"",uri); sub(dst,"",uri)
+      if (index(uri, base)==1) {
+        rel=substr(uri, length(base)+2)
+        if (rel != "") print rel
+      } else {
+        print uri
+      }
+    }' "$FAIL_KEYS" > "$rel_tmp"
+
+  {
+    echo "---- Failures by first-level prefix ----"
+    awk -F'/' '{c[$1]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+    echo
+    echo "---- Failures by first two levels ----"
+    awk -F'/' '{k=$1; if(NF>=2) k=k"/"$2; c[k]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+    echo
+    echo "---- Failures by first three levels ----"
+    awk -F'/' '{k=$1; if(NF>=2) k=k"/"$2; if(NF>=3) k=k"/"$3; c[k]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+  } > "$FAIL_PREFIX"
+fi
+
+# --- Summary -----------------------------------------------------------------
+duration=$(( end_ts - ${start_ts:-end_ts} ))
+{
+  echo "Run ID:            $RUN_ID"
+  echo "Finished:          $(date -d @"$end_ts" "+%F %T" 2>/dev/null || date -r "$end_ts")"
+  echo "Duration (s):      $duration"
+  echo "Source:            $SRC_URI"
+  echo "Destination:       $DST_URI"
+  echo
+  echo "Source objects (post):       $src_after_objs"
+  echo "Destination objects (post):  $dst_after_objs"
+  echo "Failures (unique keys):      $fail_count"
+  echo
+  echo "Progress CSV:  $PROG_CSV"
+  echo "Failure CSV:   $FAIL_CSV"
+  echo "Full log:      $FULL_LOG"
+  echo "Error log:     $ERR_LOG"
+  if (( fail_count > 0 )); then
+    echo "Failure breakdown: $FAIL_PREFIX"
+  fi
+  echo
+  echo "Exit code from sync: $sync_rc"
+} | tee "$SUM_LOG"
+
+exit "$sync_rc"
+EOF
+chmod +x syncs3.sh
