@@ -5,10 +5,8 @@ set -euo pipefail
 # syncs3.sh (post-counts only)
 # - Runs aws s3 sync via vault_keepalive.sh
 # - BASE optional: blank => full-bucket sync
-# - Per-minute progress CSV (bytes) + objects/min CSV (from "copy:" lines)
-# - Pretty, colored speedometer: shows MB/s + objs/min, prints only on new data
+# - Progress CSV + live color speedometer
 # - Object-level failure CSV + prefix breakdown
-# - Excludes legacy $folder$ markers by default
 # -----------------------------------------------------------------------------
 
 LOG_DIR="${LOG_DIR:-./logs}"
@@ -18,16 +16,14 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 FULL_LOG="$LOG_DIR/sync_${RUN_ID}.log"
 ERR_LOG="$LOG_DIR/sync_${RUN_ID}.err.log"
 SUM_LOG="$LOG_DIR/sync_${RUN_ID}.summary.txt"
-PROG_CSV="$LOG_DIR/sync_${RUN_ID}.progress.csv"            # bytes/minute
-SYNC_RAW_LOG="$LOG_DIR/sync_${RUN_ID}.raw.log"             # raw stdout from sync (copy: lines)
-COPIES_CSV="$LOG_DIR/sync_${RUN_ID}.copies_per_min.csv"    # objects/minute
+PROG_CSV="$LOG_DIR/sync_${RUN_ID}.progress.csv"
 FAIL_CSV="$LOG_DIR/sync_${RUN_ID}.failures.csv"
 FAIL_KEYS="$LOG_DIR/sync_${RUN_ID}.failkeys.txt"
 FAIL_PREFIX="$LOG_DIR/sync_${RUN_ID}.failprefix.txt"
 
-# Log this script's stdout/stderr to files + console
+# Log everything from this script
 exec > >(tee -a "$FULL_LOG") 2> >(tee -a "$ERR_LOG" >&2)
-echo "[init] Logs -> full=$FULL_LOG  errors=$ERR_LOG  progress=$PROG_CSV  copies=$COPIES_CSV  failures=$FAIL_CSV"
+echo "[init] Logs -> full=$FULL_LOG  errors=$ERR_LOG  progress=$PROG_CSV  failures=$FAIL_CSV"
 
 # --- Source helper (sets AWS tuning + SRC/DST/BASE) --------------------------
 if [[ ! -f ./awshelper.sh ]]; then
@@ -36,19 +32,19 @@ fi
 # shellcheck disable=SC1091
 source ./awshelper.sh
 
-# Only SRC/DST are required. BASE optional (blank => whole bucket).
+# Only SRC/DST are required. BASE is optional (blank => whole bucket).
 if [[ -z "${SRC:-}" || -z "${DST:-}" ]]; then
   echo "ERROR: SRC/DST must be set (in awshelper.sh or here)" >&2
   exit 1
 fi
 
-# Normalize inputs to avoid s3://bucket//prefix
+# --- Normalize inputs: strip leading/trailing slashes to avoid s3://bucket//prefix
 trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
 SRC="$(trim_slashes "$SRC")"
 DST="$(trim_slashes "$DST")"
 BASE="$(trim_slashes "${BASE:-}")"
 
-# Build URIs with/without BASE
+# Build URIs cleanly with or without BASE
 if [[ -n "${BASE:-}" ]]; then
   SRC_URI="s3://${SRC}/${BASE}"
   DST_URI="s3://${DST}/${BASE}"
@@ -61,10 +57,12 @@ fi
 echo "[init] Source      : $SRC_URI"
 echo "[init] Destination : $DST_URI"
 
-# Helpful AWS envs
+# Helpful AWS envs (resiliency)
 export AWS_PAGER=""
 export AWS_RETRY_MODE="${AWS_RETRY_MODE:-standard}"
 export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
+
+# Enable color unless explicitly disabled
 export COLOR="${COLOR:-1}"
 
 # --- Helpers -----------------------------------------------------------------
@@ -120,18 +118,16 @@ colorize() {
   z="$(tput sgr0 2>/dev/null || true)"
   awk -v r="$rate" -v g="$g" -v y="$y" -v d="$r" -v z="$z" -v t="$text" '
     BEGIN{
+      # >8 MB/s green, 1–8 yellow, <1 red
       if (r+0>8) printf "%s%s%s\n", g,t,z;
       else if (r+0>=1) printf "%s%s%s\n", y,t,z;
       else printf "%s%s%s\n", d,t,z;
     }'
 }
 
-# --- CSVs --------------------------------------------------------------------
+# --- Progress CSV + speedometer (every 60s) ----------------------------------
 echo "timestamp,total_bytes,delta_bytes,mb_per_sec" >"$PROG_CSV"
-echo "timestamp,copies" > "$COPIES_CSV"
-: > "$SYNC_RAW_LOG"   # ensure file exists for tail
 
-# Bytes/min via listing (may be >60s on big trees)
 progress_loop() {
   local prev_bytes prev_ts now_bytes now_ts delta_b delta_s mbps
   prev_bytes="$(safe_total_bytes "$DST_URI")"
@@ -149,49 +145,35 @@ progress_loop() {
   done
 }
 
-# Objects/min from "copy:" lines (silent; reads SYNC_RAW_LOG)
-copies_counter_loop() {
-  local last_ts=$(date +%s) count=0 line
-  # tail -F prints new lines as they arrive; quiet if none
-  tail -n0 -F "$SYNC_RAW_LOG" 2>/dev/null | while read -r line; do
-    [[ "$line" == copy:* ]] && ((count++))
-    local now=$(date +%s)
-    if (( now - last_ts >= 60 )); then
-      printf "%s,%d\n" "$(date -Iseconds)" "$count" >> "$COPIES_CSV"
-      count=0; last_ts=$now
-    fi
-  done
-}
-
-# Pretty, non-duplicate speedometer
 display_speedometer() {
-  local last_ts_printed="" last_copies="0"
   while kill -0 "$SYNC_PID" 2>/dev/null; do
+    # need at least header + 1 row
     if (( $(wc -l < "$PROG_CSV") > 1 )); then
+      # shell-safe CSV read
       IFS=',' read -r ts total delta rate < <(tail -n1 "$PROG_CSV")
+
+      # strip CRs just in case
       ts=${ts%$'\r'}; total=${total%$'\r'}; delta=${delta%$'\r'}; rate=${rate%$'\r'}
-      if [[ "$ts" != "$last_ts_printed" ]]; then
-        last_ts_printed="$ts"
-        # latest copies-per-minute (if any yet)
-        if (( $(wc -l < "$COPIES_CSV") > 1 )); then
-          IFS=',' read -r _ts_c _copies < <(tail -n1 "$COPIES_CSV")
-          [[ $_copies =~ ^[0-9]+$ ]] && last_copies="$_copies" || last_copies="0"
-        fi
-        # Pretty + hardened numbers
-        ts_fmt="$(date -d "$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$ts")"
-        [[ $total =~ ^[0-9]+$ ]] || total=0
-        [[ $delta =~ ^[0-9]+$ ]] || delta=0
-        [[ $rate  =~ ^[0-9.]+$ ]] || rate=0
-        local line_fmt
-        line_fmt=$(printf "[rate] %s  %s total  Δ %s  (%.3f MB/s)  [%s objs/min]" \
-          "$ts_fmt" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate" "$last_copies")
-        if (( $(printf '%.0f' "$rate") == 0 )); then
-          line_fmt="$line_fmt  (scanning)"
-        fi
-        colorize "$rate" "$line_fmt"
+
+      # pretty timestamp
+      ts_fmt="$(date -d "$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$ts")"
+
+      # harden numerics
+      [[ $total =~ ^[0-9]+$ ]] || total=0
+      [[ $delta =~ ^[0-9]+$ ]] || delta=0
+      [[ $rate  =~ ^[0-9.]+$ ]] || rate=0
+
+      line_fmt=$(printf "[rate] %s  %s total  Δ %s  (%.3f MB/s)" \
+        "$ts_fmt" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate")
+
+      # add explicit scan label
+      if (( $(printf '%.0f' "$rate") == 0 )); then
+        line_fmt="$line_fmt  (scanning)"
       fi
+
+      colorize "$rate" "$line_fmt"
     fi
-    sleep 15
+    sleep 60
   done
 }
 
@@ -200,22 +182,16 @@ start_ts=$(date +%s)
 echo "[run ] Starting sync at $(date -d @"$start_ts" "+%F %T" 2>/dev/null || date)"
 
 set +e
-# NOTE: No --only-show-errors so we get "copy:" lines.
-# Route stdout to SYNC_RAW_LOG ONLY (no console spam); stderr -> ERR_LOG.
 ./vault_keepalive.sh aws s3 sync "$SRC_URI" "$DST_URI" \
   --exclude "*\$folder\$" \
-  --exact-timestamps --size-only --no-progress \
-  > >(tee -a "$SYNC_RAW_LOG" >/dev/null) 2>>"$ERR_LOG" &
+  --exact-timestamps --size-only --no-progress --only-show-errors &
 SYNC_PID=$!
-
-# Background helpers
-progress_loop &            PROG_PID=$!
-copies_counter_loop &      COPIES_PID=$!
-display_speedometer &      SPEED_PID=$!
+progress_loop &  PROG_PID=$!
+display_speedometer &  SPEED_PID=$!
 
 wait "$SYNC_PID"
 sync_rc=$?
-kill "$PROG_PID" "$COPIES_PID" "$SPEED_PID" 2>/dev/null || true
+kill "$PROG_PID" "$SPEED_PID" 2>/dev/null || true
 set -e
 end_ts=$(date +%s)
 
@@ -229,9 +205,10 @@ echo "[post] Dest objs   (post): $dst_after_objs"
 # --- Failure parsing ---------------------------------------------------------
 : >"$FAIL_KEYS"
 if [[ -s "$ERR_LOG" ]]; then
-  grep -Eo "s3://[^ ]+" "$ERR_LOG" \
-    | grep -E "s3://${SRC}/|s3://${DST}/" \
-    | sort -u >"$FAIL_KEYS" || true
+  grep -Eo "s3://[^ ]+" "$ERR_LOG" | grep -E "s3://(${SRC}|${DST})/" | sort -u >"$FAIL_KEYS" || truegrep -Eo "s3://[^ ]+" "$ERR_LOG" \
+  | grep -E "s3://${SRC}/|s3://${DST}/" \
+  | sort -u >"$FAIL_KEYS" || true
+
 fi
 fail_count=0; [[ -s "$FAIL_KEYS" ]] && fail_count=$(wc -l <"$FAIL_KEYS" | tr -d ' ')
 
@@ -241,6 +218,34 @@ if (( fail_count > 0 )); then
     err_line="$(grep -F "$uri" "$ERR_LOG" | head -n1 | sed 's/"/'\''/g')"
     printf "\"%s\",\"%s\"\n" "$uri" "$err_line" >>"$FAIL_CSV"
   done <"$FAIL_KEYS"
+fi
+
+# Group failures by prefix depth 1–3 (relative to BASE if set)
+: >"$FAIL_PREFIX"
+if (( fail_count > 0 )); then
+  rel_tmp="$LOG_DIR/sync_${RUN_ID}.failkeys.rel.txt"
+  awk -v src="s3://${SRC}/" -v dst="s3://${DST}/" -v base="${BASE:-}" '
+    {
+      uri=$0
+      sub(src,"",uri); sub(dst,"",uri)
+      if (base != "" && index(uri, base"/")==1) {
+        rel=substr(uri, length(base)+2)
+        print rel
+      } else {
+        print uri
+      }
+    }' "$FAIL_KEYS" > "$rel_tmp"
+
+  {
+    echo "---- Failures by first-level prefix ----"
+    awk -F'/' '{c[$1]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+    echo
+    echo "---- Failures by first two levels ----"
+    awk -F'/' '{k=$1; if(NF>=2) k=k"/"$2; c[k]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+    echo
+    echo "---- Failures by first three levels ----"
+    awk -F'/' '{k=$1; if(NF>=2) k=k"/"$2; if(NF>=3) k=k"/"$3; c[k]++} END{for(k in c) printf "%8d  %s\n", c[k], k}' "$rel_tmp" | sort -nr
+  } > "$FAIL_PREFIX"
 fi
 
 # --- Summary -----------------------------------------------------------------
@@ -257,13 +262,12 @@ duration=$(( end_ts - start_ts ))
   echo "Destination objects (post):  $dst_after_objs"
   echo "Failures (unique keys):      $fail_count"
   echo
-  echo "Progress CSV (bytes/min):    $PROG_CSV"
-  echo "Copies CSV (objs/min):       $COPIES_CSV"
-  echo "Raw sync log (copy lines):   $SYNC_RAW_LOG"
-  echo "Full log:                    $FULL_LOG"
-  echo "Error log:                   $ERR_LOG"
+  echo "Progress CSV:  $PROG_CSV"
+  echo "Failure CSV:   $FAIL_CSV"
+  echo "Full log:      $FULL_LOG"
+  echo "Error log:     $ERR_LOG"
   if (( fail_count > 0 )); then
-    echo "Failure breakdown:           $FAIL_PREFIX"
+    echo "Failure breakdown: $FAIL_PREFIX"
   fi
   echo
   echo "Exit code from sync: $sync_rc"
