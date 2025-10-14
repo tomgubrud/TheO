@@ -200,13 +200,20 @@ start_ts=$(date +%s)
 echo "[run ] Starting sync at $(date -d @"$start_ts" "+%F %T" 2>/dev/null || date)"
 
 set +e
-# NOTE: No --only-show-errors so we get "copy:" lines.
-# Route stdout to SYNC_RAW_LOG ONLY (no console spam); stderr -> ERR_LOG.
+
+# Note: forward stdout through a tee → raw log AND to console,
+# but filter out noisy "copy:" lines so terminal isn't spammed.
+# Keep stderr in ERR_LOG.
+command -v stdbuf >/dev/null || stdbuf() { "$@"; }  # fallback if stdbuf not present
+
 ./vault_keepalive.sh aws s3 sync "$SRC_URI" "$DST_URI" \
   --exclude "*\$folder\$" \
   --exact-timestamps --size-only --no-progress \
-  > >(tee -a "$SYNC_RAW_LOG" >/dev/null) 2>>"$ERR_LOG" &
+  > >(stdbuf -oL tee -a "$SYNC_RAW_LOG" | stdbuf -oL grep --line-buffered -v '^copy:') \
+  2>>"$ERR_LOG" &
+
 SYNC_PID=$!
+
 
 # Background helpers
 progress_loop &            PROG_PID=$!
