@@ -147,20 +147,30 @@ progress_loop() {
 
 display_speedometer() {
   while kill -0 "$SYNC_PID" 2>/dev/null; do
-    if [[ $(wc -l <"$PROG_CSV") -gt 1 ]]; then
-      local line ts total delta rate line_fmt
-      line="$(tail -n1 "$PROG_CSV")"
-      [[ "$line" == timestamp,* ]] && sleep 5 && continue
-      ts="$(cut -d',' -f1 <<<"$line")"
-      total="$(cut -d',' -f2 <<<"$line")"; total="$(_safe_number "$total")"
-      delta="$(cut -d',' -f3 <<<"$line")"; delta="$(_safe_number "$delta")"
-      rate="$(cut -d',' -f4 <<<"$line")"; [[ "$rate" =~ ^[0-9.]+$ ]] || rate="0"
+    # need at least header + 1 row
+    if (( $(wc -l < "$PROG_CSV") > 1 )); then
+      # shell-safe CSV read
+      IFS=',' read -r ts total delta rate < <(tail -n1 "$PROG_CSV")
+
+      # strip CRs just in case
+      ts=${ts%$'\r'}; total=${total%$'\r'}; delta=${delta%$'\r'}; rate=${rate%$'\r'}
+
+      # pretty timestamp
+      ts_fmt="$(date -d "$ts" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "$ts")"
+
+      # harden numerics
+      [[ $total =~ ^[0-9]+$ ]] || total=0
+      [[ $delta =~ ^[0-9]+$ ]] || delta=0
+      [[ $rate  =~ ^[0-9.]+$ ]] || rate=0
+
       line_fmt=$(printf "[rate] %s  %s total  Δ %s  (%.3f MB/s)" \
-        "$ts" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate")
-      # label scanning periods
-      if [[ "$rate" == "0" || "$rate" == "0.000" ]]; then
-        line_fmt="$line_fmt  (scanning source)"
+        "$ts_fmt" "$(human_bytes "$total")" "$(human_bytes "$delta")" "$rate")
+
+      # add explicit scan label
+      if (( $(printf '%.0f' "$rate") == 0 )); then
+        line_fmt="$line_fmt  (scanning)"
       fi
+
       colorize "$rate" "$line_fmt"
     fi
     sleep 60
