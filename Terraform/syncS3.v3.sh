@@ -5,11 +5,11 @@ set -euo pipefail
 # syncs3.sh (post-counts only)
 # - Runs aws s3 sync via vault_keepalive.sh
 # - BASE optional: blank => full-bucket sync
-# - Bytes/minute CSV (dest size delta) + objs/minute CSV (from "copy:" lines)
+# - Bytes/min CSV (dest delta) + Objs/min CSV (from "copy:" lines)
 # - Pretty, colored speedometer (prints only on new CSV rows)
-# - Keepalive + lease messages shown in terminal (copy spam suppressed)
-# - Session heartbeat to keep DevSpaces alive (1 line/4m; SESSION_KEEPALIVE=0 to disable)
-# - "Second-level prefix" notifier: prints when first folder under BASE changes
+# - Keepalive + lease messages in terminal (copy spam suppressed)
+# - Session heartbeat (default on; SESSION_KEEPALIVE=0 to disable)
+# - "Prefix change" notifier with configurable depth (PREFIX_DEPTH, default 2)
 # - Excludes legacy $folder$ markers by default
 # -----------------------------------------------------------------------------
 
@@ -21,16 +21,20 @@ FULL_LOG="$LOG_DIR/sync_${RUN_ID}.log"
 ERR_LOG="$LOG_DIR/sync_${RUN_ID}.err.log"
 SUM_LOG="$LOG_DIR/sync_${RUN_ID}.summary.txt"
 PROG_CSV="$LOG_DIR/sync_${RUN_ID}.progress.csv"            # bytes/minute
-SYNC_RAW_LOG="$LOG_DIR/sync_${RUN_ID}.raw.log"             # raw stdout from sync (copy: + keepalive)
+SYNC_RAW_LOG="$LOG_DIR/sync_${RUN_ID}.raw.log"             # raw stdout from sync (copy:+keepalive)
 COPIES_CSV="$LOG_DIR/sync_${RUN_ID}.copies_per_min.csv"    # objects/minute
 FAIL_CSV="$LOG_DIR/sync_${RUN_ID}.failures.csv"
 FAIL_KEYS="$LOG_DIR/sync_${RUN_ID}.failkeys.txt"
 FAIL_PREFIX="$LOG_DIR/sync_${RUN_ID}.failprefix.txt"
 PREFIX_LOG="$LOG_DIR/sync_${RUN_ID}.prefix_changes.log"
+PREFIX_STATE="$LOG_DIR/sync_${RUN_ID}.prefix_state"        # current_prefix|start_epoch|count
+
+# Config
+PREFIX_DEPTH="${PREFIX_DEPTH:-2}"   # 1 = first segment under BASE, 2 = default, etc.
 
 # Log this script's stdout/stderr to files + console
 exec > >(tee -a "$FULL_LOG") 2> >(tee -a "$ERR_LOG" >&2)
-echo "[init] Logs -> full=$FULL_LOG  errors=$ERR_LOG  progress=$PROG_CSV  copies=$COPIES_CSV  failures=$FAIL_CSV  prefix=$PREFIX_LOG"
+echo "[init] Logs -> full=$FULL_LOG  errors=$ERR_LOG  progress=$PROG_CSV  copies=$COPIES_CSV  prefix=$PREFIX_LOG"
 
 # --- Source helper (sets AWS tuning + SRC/DST/BASE) --------------------------
 if [[ ! -f ./awshelper.sh ]]; then
@@ -39,7 +43,7 @@ fi
 # shellcheck disable=SC1091
 source ./awshelper.sh
 
-# Only SRC/DST are required. BASE optional (blank => whole bucket).
+# Only SRC/DST required. BASE optional (blank => whole bucket).
 if [[ -z "${SRC:-}" || -z "${DST:-}" ]]; then
   echo "ERROR: SRC/DST must be set (in awshelper.sh or here)" >&2
   exit 1
@@ -129,13 +133,16 @@ colorize() {
     }'
 }
 
+now_ts_h() { date '+%Y-%m-%d %H:%M:%S'; }
+
 # --- CSVs / logs -------------------------------------------------------------
 echo "timestamp,total_bytes,delta_bytes,mb_per_sec" >"$PROG_CSV"   # bytes/min
 echo "timestamp,copies" > "$COPIES_CSV"                            # objs/min
 : > "$SYNC_RAW_LOG"
 : > "$PREFIX_LOG"
+: > "$PREFIX_STATE"
 
-# Bytes/min via listing (may be >60s on big trees) — now seeds immediately
+# Bytes/min via listing (may be >60s on big trees) — seed immediately
 progress_loop() {
   local prev_bytes=0 prev_ts now_bytes now_ts delta_b delta_s mbps first=1
   prev_ts="$(date +%s)"
@@ -158,40 +165,88 @@ progress_loop() {
   done
 }
 
-# Objects/min from "copy:" lines (silent; reads SYNC_RAW_LOG) + 2nd-level prefix notifier
-copies_counter_loop() {
-  local last_ts=$(date +%s) count=0 line last_prefix=""
-  tail -n0 -F "$SYNC_RAW_LOG" 2>/dev/null | while read -r line; do
-    # Count copies
-    [[ "$line" == copy:* ]] && ((count++))
-    # Prefix notifier (second level: first folder under BASE)
-    if [[ "$line" == copy:* ]]; then
-      # extract s3://SRC/... path from the copy line
-      # examples:
-      # copy: s3://bucket/base/XXX/yyy/file -> ...
-      rel="${line#copy: s3://$SRC/}"       # drop scheme+bucket
-      # strip BASE/ if present
-      if [[ -n "$BASE" && "$rel" == "$BASE/"* ]]; then
-        rel="${rel#${BASE}/}"
-      fi
-      # take first segment as the "second-level prefix"
-      lvl1="${rel%%/*}"
-      if [[ -n "$lvl1" && "$lvl1" != "$last_prefix" ]]; then
-        last_prefix="$lvl1"
-        msg="[prefix] now copying: ${lvl1}"
-        echo "$msg" | tee -a "$PREFIX_LOG"
-      fi
+# Extract N-level prefix under BASE from a copy line
+_extract_prefix_n() {
+  # Input: full "copy: s3://SRC/<key>" line
+  local line="$1" rel key IFS='/' parts=() out="" depth="$PREFIX_DEPTH"
+  key="${line#copy: s3://$SRC/}"           # drop scheme+bucket
+  # strip BASE/ if present
+  if [[ -n "$BASE" && "$key" == "$BASE/"* ]]; then
+    rel="${key#${BASE}/}"
+  else
+    rel="$key"
+  fi
+  # split and join first N segments
+  IFS='/' read -r -a parts <<< "$rel"
+  local i
+  for ((i=0;i<depth && i<${#parts[@]};i++)); do
+    if [[ -n "${parts[$i]}" ]]; then
+      [[ -z "$out" ]] && out="${parts[$i]}" || out="$out/${parts[$i]}"
     fi
-    # flush copies each minute
+  done
+  echo "$out"
+}
+
+# Emit start message
+_prefix_start() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  local ts="$(now_ts_h)"
+  echo "[prefix] ${ts} now copying: ${p}" | tee -a "$PREFIX_LOG"
+}
+
+# Emit done message
+_prefix_done() {
+  local p="$1" count="$2"
+  [[ -z "$p" ]] && return 0
+  local ts="$(now_ts_h)"
+  if [[ "$count" == "0" ]]; then
+    echo "[prefix] ${ts} done: ${p} — nothing new to copy" | tee -a "$PREFIX_LOG"
+  else
+    echo "[prefix] ${ts} done: ${p} — ${count} objects copied" | tee -a "$PREFIX_LOG"
+  fi
+}
+
+# Objects/min from "copy:" lines (silent; reads SYNC_RAW_LOG) + prefix notifier
+copies_counter_loop() {
+  local last_ts=$(date +%s) count=0 line
+  local current_prefix=""; local prefix_start_epoch=0
+
+  # initialize state file
+  printf "|0|0\n" > "$PREFIX_STATE"   # format: prefix|start_epoch|count
+
+  tail -n0 -F "$SYNC_RAW_LOG" 2>/dev/null | while read -r line; do
+    # track copies
+    if [[ "$line" == copy:* ]]; then
+      ((count++))
+      # detect prefix of configured depth
+      newp="$(_extract_prefix_n "$line")"
+      if [[ -n "$newp" && "$newp" != "$current_prefix" ]]; then
+        # finish previous prefix (if any)
+        if [[ -n "$current_prefix" ]]; then
+          _prefix_done "$current_prefix" "$count"
+          count=0
+        fi
+        current_prefix="$newp"
+        prefix_start_epoch="$(date +%s)"
+        _prefix_start "$current_prefix"
+      fi
+      # persist state so main thread can print final "done" at shutdown
+      printf "%s|%s|%s\n" "$current_prefix" "$prefix_start_epoch" "$count" > "$PREFIX_STATE"
+    fi
+
+    # flush copies per-minute
     now=$(date +%s)
     if (( now - last_ts >= 60 )); then
       printf "%s,%d\n" "$(date -Iseconds)" "$count" >> "$COPIES_CSV"
       count=0; last_ts=$now
+      # persist state each minute too
+      printf "%s|%s|%s\n" "$current_prefix" "$prefix_start_epoch" "$count" > "$PREFIX_STATE"
     fi
   done
 }
 
-# Pretty, non-duplicate speedometer (prints only when PROG_CSV gains a row)
+# Pretty, non-duplicate speedometer (prints only on new PROG_CSV rows)
 display_speedometer() {
   local last_ts_printed="" last_copies="0"
   while kill -0 "$SYNC_PID" 2>/dev/null; do
@@ -224,7 +279,7 @@ display_speedometer() {
 # Keep browser terminal alive (optional; default on)
 session_keepalive_loop() {
   while kill -0 "$SYNC_PID" 2>/dev/null; do
-    printf "[heartbeat] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "[heartbeat] %s\n" "$(now_ts_h)"
     sleep 240
   done
 }
@@ -255,6 +310,15 @@ fi
 
 wait "$SYNC_PID"
 sync_rc=$?
+
+# Flush a final "done" message for the last in-flight prefix (if any)
+if [[ -s "$PREFIX_STATE" ]]; then
+  IFS='|' read -r cur_pfx pfx_start pfx_count < "$PREFIX_STATE" || true
+  if [[ -n "${cur_pfx:-}" ]]; then
+    _prefix_done "$cur_pfx" "${pfx_count:-0}"
+  fi
+fi
+
 kill "$PROG_PID" "$COPIES_PID" "$SPEED_PID" ${HEART_PID:+$HEART_PID} 2>/dev/null || true
 set -e
 end_ts=$(date +%s)
