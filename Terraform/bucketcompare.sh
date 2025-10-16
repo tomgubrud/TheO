@@ -306,31 +306,35 @@ done < "$RES_FILE"
 cat "$RES_FILE" >> "$CSV_FILE"
 
 # --- summary (foreground prints; can also use print_sync for consistency) -----
-echo
-echo "Grand Totals"
-printf "  SRC objects: %12d   (%s)\n" "$TOTAL_SRC_OBJS" "$(human_bytes "$TOTAL_SRC_BYTES")"
-printf "  DST objects: %12d   (%s)\n" "$TOTAL_DST_OBJS" "$(human_bytes "$TOTAL_DST_BYTES")"
+print_sync ""
+print_sync "Grand Totals"
+print_sync "$(printf "  SRC objects: %12d   (%s)" "$TOTAL_SRC_OBJS" "$(human_bytes "$TOTAL_SRC_BYTES")")"
+print_sync "$(printf "  DST objects: %12d   (%s)" "$TOTAL_DST_OBJS" "$(human_bytes "$TOTAL_DST_BYTES")")"
 
-echo
 if (( MISS_DST_PREFIXES > 0 )); then
-  printf "%sMissing in DST%s\n" "$BOLD" "$RESET"
-  printf "  Prefixes (had gaps when checked): %d\n" "$MISS_DST_PREFIXES"
-  printf "  SRC-side objects (sum of those prefixes): %d\n" "$MISS_DST_OBJS"
-  printf "  SRC-side size (sum of those prefixes):   %s (%s GiB)\n" \
-    "$(human_bytes "$MISS_DST_BYTES")" "$(bytes_to_gib "$MISS_DST_BYTES")"
-  [[ -s "$MISSING_LOG" ]] && printf "  Keys log:  %s\n" "$MISSING_LOG"
+  print_sync ""
+  print_sync "$(printf "%sMissing in DST%s" "$BOLD" "$RESET")"
+  print_sync "$(printf "  Prefixes (had gaps when checked): %d" "$MISS_DST_PREFIXES")"
+  print_sync "$(printf "  SRC-side objects (sum of those prefixes): %d" "$MISS_DST_OBJS")"
+  print_sync "$(printf "  SRC-side size (sum of those prefixes):   %s (%s GiB)" \
+                "$(human_bytes "$MISS_DST_BYTES")" "$(bytes_to_gib "$MISS_DST_BYTES")")"
+  [[ -s "$MISSING_LOG" ]] && print_sync "$(printf "  Keys log:  %s" "$MISSING_LOG")"
 else
-  printf "%sNo prefixes were missing in DST at check time.%s\n" "$GREEN" "$RESET"
+  print_sync ""
+  print_sync "$(printf "%sNo prefixes were missing in DST at check time.%s" "$GREEN" "$RESET")"
   [[ "${LIST_MISSING:-1}" = "1" && ! -s "$MISSING_LOG" ]] && rm -f "$MISSING_LOG"
 fi
 
 if [[ -s "$EXTRAS_LOG" ]]; then
-  printf "  Extras log: %s\n" "$EXTRAS_LOG"
+  print_sync "$(printf "  Extras log: %s" "$EXTRAS_LOG")"
 else
   [[ "${LIST_EXTRAS:-1}" = "1" ]] && rm -f "$EXTRAS_LOG"
 fi
 
-printf "\nCSV:  %s\nLOG:  %s\n" "$CSV_FILE" "$LOG_FILE"
+print_sync ""
+print_sync "$(printf "CSV:  %s" "$CSV_FILE")"
+print_sync "$(printf "LOG:  %s" "$LOG_FILE")"
+
 
 # --- cleanup ------------------------------------------------------------------
 rm -rf "$TMP_DIR"
