@@ -2,24 +2,21 @@
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
-# bucket_compare.sh
+# bucket_compare.sh  (FIFO-logger version)
 # ------------------------------------------------------------------------------
-# Compares object COUNTS and BYTES for next-level prefixes between two S3 buckets.
 # - Sources ./awshelper.sh (sets SRC, DST, optional BASE)
-# - Prompts for a substring to match prefixes
-# - One background job per prefix (concurrency-capped)
-# - Colored output, CSV, human log
-# - Optional per-prefix key diffs:
-#     * Missing in DST (SRC − DST)  -> missing_keys_<RUN_ID>_<PID>.log
-#     * Extras in DST  (DST − SRC)  -> extra_keys_<RUN_ID>_<PID>.log
-# - Serialized background printing to avoid TTY stalls (“press Enter to continue”)
+# - Compares next-level prefixes under BASE (or bucket root)
+# - Background job per prefix (concurrency-capped)
+# - Single foreground logger prints all lines => no "press Enter" glitch
+# - Optional key diffs:
+#     * Missing in DST (SRC − DST)  -> missing_keys_<RUN>_<PID>.log
+#     * Extras in DST  (DST − SRC)  -> extra_keys_<RUN>_<PID>.log
 # ------------------------------------------------------------------------------
 
-# --- config -------------------------------------------------------------------
 LOG_DIR="${LOG_DIR:-./logs}"
 CONCURRENCY="${CONCURRENCY:-8}"        # 0 = unlimited
-LIST_MISSING="${LIST_MISSING:-1}"      # 1 = write keys present in SRC but not in DST
-LIST_EXTRAS="${LIST_EXTRAS:-1}"        # 1 = write keys present in DST but not in SRC
+LIST_MISSING="${LIST_MISSING:-1}"      # 1 = list keys present in SRC but not in DST
+LIST_EXTRAS="${LIST_EXTRAS:-1}"        # 1 = list keys present in DST but not in SRC
 mkdir -p "$LOG_DIR"
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
@@ -32,7 +29,7 @@ EXTRAS_LOG="$LOG_DIR/extra_keys_${RUN_ID}_${SELF_PID}.log"
 
 TMP_DIR="$(mktemp -d -t compare_${RUN_ID}_${SELF_PID}.XXXX)"
 
-# --- colors -------------------------------------------------------------------
+# ---------- colors ----------
 if [[ -t 1 ]]; then
   GREEN="$(tput setaf 2 || true)"; RED="$(tput setaf 1 || true)"; YEL="$(tput setaf 3 || true)"
   BOLD="$(tput bold || true)"; RESET="$(tput sgr0 || true)"
@@ -40,18 +37,14 @@ else
   GREEN=""; RED=""; YEL=""; BOLD=""; RESET=""
 fi
 
-say()  { printf "%s\n" "$*"; }
-warn() { printf "%s[WARN]%s %s\n"  "$YEL" "$RESET" "$*"; }
-err()  { printf "%s[ERROR]%s %s\n" "$RED" "$RESET" "$*" >&2; }
-
-# --- prerequisites ------------------------------------------------------------
-command -v aws >/dev/null 2>&1 || { err "aws CLI not found"; exit 127; }
-[[ -f ./awshelper.sh ]] || { err "awshelper.sh not found"; exit 1; }
+# ---------- prerequisites ----------
+command -v aws >/dev/null 2>&1 || { printf "[ERROR] aws CLI not found\n" >&2; exit 127; }
+[[ -f ./awshelper.sh ]] || { printf "[ERROR] awshelper.sh not found\n" >&2; exit 1; }
 # shellcheck disable=SC1091
 source ./awshelper.sh
-[[ -n "${SRC:-}" && -n "${DST:-}" ]] || { err "SRC and DST must be set (awshelper.sh)"; exit 1; }
+[[ -n "${SRC:-}" && -n "${DST:-}" ]] || { printf "[ERROR] SRC and DST must be set (awshelper.sh)\n" >&2; exit 1; }
 
-# --- utils --------------------------------------------------------------------
+# ---------- utils ----------
 trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
 human_bytes() {
   local b="${1:-0}"
@@ -65,7 +58,6 @@ human_bytes() {
 bytes_to_gib() { awk -v b="${1:-0}" 'BEGIN{printf "%.3f", b/1073741824}'; }
 safe_number()  { [[ "${1:-}" =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }
 
-# Summarize an S3 URI: "count bytes" (or "0 0" on error, logging details).
 summarize_objects_and_bytes() {
   local uri="$1" out rc objs bytes
   set +e
@@ -73,7 +65,7 @@ summarize_objects_and_bytes() {
   rc=$?
   set -e
   if (( rc != 0 )); then
-    warn "Failed to summarize: $uri (treating as 0). Details in $LOG_FILE"
+    printf "[WARN] Failed to summarize: %s (treating as 0)\n" "$uri" >> "$LOG_FILE"
     sed -e "s/^/[aws stderr] /" "$TMP_DIR/.err.$SELF_PID" >> "$LOG_FILE" || true
     echo "0 0"
     return
@@ -83,11 +75,7 @@ summarize_objects_and_bytes() {
   echo "$(safe_number "$objs") $(safe_number "$bytes")"
 }
 
-# Extract normalized keys (one per line) from `aws s3 ls --recursive` output.
-# - Strips date/time/size columns
-# - Removes leading "./" or "/" if present
-# - Drops blank/CRLF lines
-# - Outputs clean relative keys suitable for sort/comm
+# normalized key list (for comm)
 list_keys() {
   local uri="$1"
   aws s3 ls "$uri" --recursive \
@@ -103,24 +91,32 @@ bg_gate() {
   fi
 }
 
-# list next-level prefixes under a base uri (trailing slash)
+# list next-level prefixes under base uri (trailing slash)
 list_next_level_prefixes() {
   local base_uri="$1"
   aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
 }
 
-# --- serialized screen printer to avoid TTY contention ------------------------
-SCREEN_LOCK="$TMP_DIR/.screen.lock"
-print_sync() {
-  local msg="$1"
-  {
-    flock 9
-    # write directly to terminal to avoid redirected stdout buffering
-    printf "%s\n" "$msg" > /dev/tty
-  } 9>"$SCREEN_LOCK"
+# ---------- SINGLE WRITER LOGGER (FIFO) ----------
+FIFO="$TMP_DIR/screen.fifo"
+mkfifo "$FIFO"
+
+# foreground logger: prints every line from FIFO to stdout
+(
+  while IFS= read -r line; do
+    [[ "$line" == "__SCREEN_EOF__" ]] && break
+    printf "%s\n" "$line"
+  done < "$FIFO"
+) &
+LOGGER_PID=$!
+
+# screen_print writes one line into the FIFO (non-blocking for long lines)
+screen_print() {
+  # open, write, close per call → no dangling writers after jobs finish
+  printf "%s\n" "$1" > "$FIFO"
 }
 
-# --- scope setup --------------------------------------------------------------
+# ---------- scope ----------
 BASE="$(trim_slashes "${BASE:-}")"
 if [[ -n "$BASE" ]]; then
   SRC_BASE_URI="s3://${SRC}/${BASE}/"
@@ -132,65 +128,58 @@ else
   MODE="FULL BUCKET"
 fi
 
-# --- header -------------------------------------------------------------------
-cat <<HDR
-------------------------------------------------------------
- Compare: ${SRC}  ->  ${DST}
- Mode:    ${MODE}
- CSV:     $CSV_FILE
- Log:     $LOG_FILE
- Missing: $([[ "$LIST_MISSING" = "1" ]] && echo "$MISSING_LOG" || echo "disabled")
- Extras:  $([[ "$LIST_EXTRAS"  = "1" ]] && echo "$EXTRAS_LOG"  || echo "disabled")
- Run ID:  ${RUN_ID}  (PID ${SELF_PID})
-------------------------------------------------------------
-HDR
+# ---------- header ----------
+screen_print "------------------------------------------------------------"
+screen_print " Compare: ${SRC}  ->  ${DST}"
+screen_print " Mode:    ${MODE}"
+screen_print " CSV:     $CSV_FILE"
+screen_print " Log:     $LOG_FILE"
+screen_print " Missing: $([[ "$LIST_MISSING" = "1" ]] && echo "$MISSING_LOG" || echo "disabled")"
+screen_print " Extras:  $([[ "$LIST_EXTRAS"  = "1" ]] && echo "$EXTRAS_LOG"  || echo "disabled")"
+screen_print " Run ID:  ${RUN_ID}  (PID ${SELF_PID})"
+screen_print "------------------------------------------------------------"
 
-# prompt for filter substring
+# prompt for filter substring (must use real stdin)
 read -rp "Enter any part of the next-level prefix to compare (e.g., 2021, myfolder): " FILTER
 FILTER="${FILTER:-}"
 
-# --- prepare outputs ----------------------------------------------------------
+# prepare outputs
 echo "prefix,src_count,src_bytes,dst_count,dst_bytes,match" > "$CSV_FILE"
 : > "$LOG_FILE"
 : > "$MISSING_LOG"
 : > "$EXTRAS_LOG"
 
-# --- build prefix list --------------------------------------------------------
-say "Scanning prefixes under: ${SRC_BASE_URI}"
+# build prefix list
+screen_print "Scanning prefixes under: ${SRC_BASE_URI}"
 mapfile -t ALL_PREFIXES < <(list_next_level_prefixes "$SRC_BASE_URI")
 
 FILTERED=()
 for p in "${ALL_PREFIXES[@]}"; do
   if [[ -z "$FILTER" || "${p,,}" == *"${FILTER,,}"* ]]; then
-    FILTERED+=("${p%/}")   # strip trailing slash
+    FILTERED+=("${p%/}")
   fi
 done
 
 if ((${#FILTERED[@]}==0)); then
-  warn "No prefixes matched filter '${FILTER}'. Nothing to compare."
+  screen_print "[WARN] No prefixes matched filter '${FILTER}'. Nothing to compare."
+  # tell logger to exit and wait
+  screen_print "__SCREEN_EOF__"; wait "$LOGGER_PID" || true
   rm -rf "$TMP_DIR"
   exit 0
 fi
 
-say "Comparing ${#FILTERED[@]} prefix(es):"
-for p in "${FILTERED[@]}"; do echo " - $p"; done
-echo
+screen_print "Comparing ${#FILTERED[@]} prefix(es):"
+for p in "${FILTERED[@]}"; do screen_print " - $p"; done
+screen_print ""
 
-# --- accumulators -------------------------------------------------------------
-TOTAL_SRC_OBJS=0
-TOTAL_DST_OBJS=0
-TOTAL_SRC_BYTES=0
-TOTAL_DST_BYTES=0
+# accumulators
+TOTAL_SRC_OBJS=0; TOTAL_DST_OBJS=0; TOTAL_SRC_BYTES=0; TOTAL_DST_BYTES=0
+MISS_DST_PREFIXES=0; MISS_DST_OBJS=0; MISS_DST_BYTES=0
 
-MISS_DST_PREFIXES=0
-MISS_DST_OBJS=0
-MISS_DST_BYTES=0
-
-# --- per-prefix worker --------------------------------------------------------
+# worker
 compare_one_prefix() {
   local PFX="$1"
   local SRC_URI DST_URI
-
   if [[ -n "$BASE" ]]; then
     SRC_URI="s3://${SRC}/${BASE}/${PFX}"
     DST_URI="s3://${DST}/${BASE}/${PFX}"
@@ -217,7 +206,7 @@ compare_one_prefix() {
       "$PFX" "$SRC_URI" "$DST_URI" "$SRC_COUNT" "$SRC_BYTES" "$DST_COUNT" "$DST_BYTES" >> "$LOG_FILE"
   fi
 
-  # --- Missing in DST (SRC − DST) with recheck + normalized diff ---------------
+  # Missing in DST (SRC − DST) with recheck + normalized diff
   if (( SRC_COUNT > DST_COUNT )) && [[ "$LIST_MISSING" = "1" ]]; then
     read -r re_dc _ <<<"$(summarize_objects_and_bytes "$DST_URI")"
     if (( SRC_COUNT > re_dc )); then
@@ -246,7 +235,7 @@ compare_one_prefix() {
     fi
   fi
 
-  # --- Extras in DST (DST − SRC) with recheck + normalized diff ----------------
+  # Extras in DST (DST − SRC) with recheck + normalized diff
   if (( DST_COUNT > SRC_COUNT )) && [[ "$LIST_EXTRAS" = "1" ]]; then
     read -r re_sc _ <<<"$(summarize_objects_and_bytes "$SRC_URI")"
     if (( DST_COUNT > re_sc )); then
@@ -271,29 +260,29 @@ compare_one_prefix() {
     fi
   fi
 
-  # print to screen (serialized)
-  print_sync "$LINE"
+  # print line via FIFO logger
+  screen_print "$LINE"
 
   # per-job CSV
   local SAFE_PFX2="${PFX//\//__}"
-  local JOB_OUT="$TMP_DIR/res_${RUN_ID}_${SELF_PID}_${SAFE_PFX2}.csv"
   printf "%s,%s,%s,%s,%s,%s\n" \
-    "$PFX" "$SRC_COUNT" "$SRC_BYTES" "$DST_COUNT" "$DST_BYTES" "$MATCH" > "$JOB_OUT"
+    "$PFX" "$SRC_COUNT" "$SRC_BYTES" "$DST_COUNT" "$DST_BYTES" "$MATCH" \
+    > "$TMP_DIR/res_${RUN_ID}_${SELF_PID}_${SAFE_PFX2}.csv"
 }
 
-# --- dispatch jobs (detach stdin) --------------------------------------------
+# dispatch jobs (detach stdin)
 for PFX in "${FILTERED[@]}"; do
   bg_gate
   compare_one_prefix "$PFX" </dev/null &
 done
 wait
 
-# --- gather per-job results ---------------------------------------------------
+# gather per-job results
 RES_FILE="$TMP_DIR/results_${RUN_ID}_${SELF_PID}.csv"
 : > "$RES_FILE"
 cat "$TMP_DIR"/res_"${RUN_ID}"_"${SELF_PID}"_*.csv > "$RES_FILE" 2>/dev/null || :
 
-# --- aggregate totals ---------------------------------------------------------
+# aggregate
 while IFS=',' read -r pfx sc sb dc db m; do
   [[ "${pfx:-}" == "prefix" || -z "${pfx:-}" ]] && continue
   [[ "$sc" =~ ^[0-9]+$ ]] && (( TOTAL_SRC_OBJS += sc ))
@@ -302,41 +291,43 @@ while IFS=',' read -r pfx sc sb dc db m; do
   [[ "$db" =~ ^[0-9]+$ ]] && (( TOTAL_DST_BYTES += db ))
 done < "$RES_FILE"
 
-# append to main CSV (already has header)
+# append main CSV
 cat "$RES_FILE" >> "$CSV_FILE"
 
-# --- summary (foreground prints; can also use print_sync for consistency) -----
-print_sync ""
-print_sync "Grand Totals"
-print_sync "$(printf "  SRC objects: %12d   (%s)" "$TOTAL_SRC_OBJS" "$(human_bytes "$TOTAL_SRC_BYTES")")"
-print_sync "$(printf "  DST objects: %12d   (%s)" "$TOTAL_DST_OBJS" "$(human_bytes "$TOTAL_DST_BYTES")")"
+# summary via FIFO (so logger controls terminal)
+screen_print ""
+screen_print "Grand Totals"
+screen_print "$(printf "  SRC objects: %12d   (%s)" "$TOTAL_SRC_OBJS" "$(human_bytes "$TOTAL_SRC_BYTES")")"
+screen_print "$(printf "  DST objects: %12d   (%s)" "$TOTAL_DST_OBJS" "$(human_bytes "$TOTAL_DST_BYTES")")"
 
 if (( MISS_DST_PREFIXES > 0 )); then
-  print_sync ""
-  print_sync "$(printf "%sMissing in DST%s" "$BOLD" "$RESET")"
-  print_sync "$(printf "  Prefixes (had gaps when checked): %d" "$MISS_DST_PREFIXES")"
-  print_sync "$(printf "  SRC-side objects (sum of those prefixes): %d" "$MISS_DST_OBJS")"
-  print_sync "$(printf "  SRC-side size (sum of those prefixes):   %s (%s GiB)" \
-                "$(human_bytes "$MISS_DST_BYTES")" "$(bytes_to_gib "$MISS_DST_BYTES")")"
-  [[ -s "$MISSING_LOG" ]] && print_sync "$(printf "  Keys log:  %s" "$MISSING_LOG")"
+  screen_print ""
+  screen_print "$(printf "%sMissing in DST%s" "$BOLD" "$RESET")"
+  screen_print "$(printf "  Prefixes (had gaps when checked): %d" "$MISS_DST_PREFIXES")"
+  screen_print "$(printf "  SRC-side objects (sum of those prefixes): %d" "$MISS_DST_OBJS")"
+  screen_print "$(printf "  SRC-side size (sum of those prefixes):   %s (%s GiB)" \
+                  "$(human_bytes "$MISS_DST_BYTES")" "$(bytes_to_gib "$MISS_DST_BYTES")")"
+  [[ -s "$MISSING_LOG" ]] && screen_print "$(printf "  Keys log:  %s" "$MISSING_LOG")"
 else
-  print_sync ""
-  print_sync "$(printf "%sNo prefixes were missing in DST at check time.%s" "$GREEN" "$RESET")"
+  screen_print ""
+  screen_print "$(printf "%sNo prefixes were missing in DST at check time.%s" "$GREEN" "$RESET")"
   [[ "${LIST_MISSING:-1}" = "1" && ! -s "$MISSING_LOG" ]] && rm -f "$MISSING_LOG"
 fi
 
 if [[ -s "$EXTRAS_LOG" ]]; then
-  print_sync "$(printf "  Extras log: %s" "$EXTRAS_LOG")"
+  screen_print "$(printf "  Extras log: %s" "$EXTRAS_LOG")"
 else
   [[ "${LIST_EXTRAS:-1}" = "1" ]] && rm -f "$EXTRAS_LOG"
 fi
 
-print_sync ""
-print_sync "$(printf "CSV:  %s" "$CSV_FILE")"
-print_sync "$(printf "LOG:  %s" "$LOG_FILE")"
+screen_print ""
+screen_print "$(printf "CSV:  %s" "$CSV_FILE")"
+screen_print "$(printf "LOG:  %s" "$LOG_FILE")"
 
+# tell logger to exit and wait for it (ensures prompt returns immediately)
+screen_print "__SCREEN_EOF__"
+wait "$LOGGER_PID" || true
 
-# --- cleanup ------------------------------------------------------------------
+# cleanup
 rm -rf "$TMP_DIR"
-# ensure terminal is sane even if a tool messed with it
 command -v stty >/dev/null 2>&1 && stty sane || true
