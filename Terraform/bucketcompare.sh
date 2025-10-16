@@ -51,6 +51,19 @@ source ./awshelper.sh
 [[ -n "${SRC:-}" && -n "${DST:-}" ]] || { err "SRC and DST must be set (awshelper.sh)"; exit 1; }
 
 # --- utils --------------------------------------------------------------------
+# A tiny screen printer that serializes writes from background jobs
+SCREEN_LOCK="$TMP_DIR/.screen.lock"
+
+print_sync() {
+  local msg="$1"
+  {
+    flock 9
+    # write directly to the user's TTY so we don't fight with redirected stdout
+    printf "%s\n" "$msg" > /dev/tty
+  } 9>"$SCREEN_LOCK"
+}
+
+
 trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
 human_bytes() {
   local b="${1:-0}"
@@ -254,13 +267,15 @@ compare_one_prefix() {
           sed -e "s#^#s3://${DST}/#" "$EXTRA_KEYS"
           echo
         } >> "$EXTRAS_LOG"
-        printf "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
+        # printf "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
+        print_sync "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
           "$PFX" "$(wc -l < "$EXTRA_KEYS" | tr -d ' ')" "$EXTRAS_LOG" >> "$LOG_FILE"
       fi
     fi
   fi
 
-  printf "%s\n" "$LINE"
+  # printf "%s\n" "$LINE"
+  print_sync "$LINE"
 
   # per-job CSV
   local SAFE_PFX2="${PFX//\//__}"
@@ -272,7 +287,8 @@ compare_one_prefix() {
 # --- dispatch jobs ------------------------------------------------------------
 for PFX in "${FILTERED[@]}"; do
   bg_gate
-  compare_one_prefix "$PFX" &
+  # compare_one_prefix "$PFX" &
+  compare_one_prefix "$PFX" </dev/null &
 done
 wait
 
@@ -322,3 +338,4 @@ printf "\nCSV:  %s\nLOG:  %s\n" "$CSV_FILE" "$LOG_FILE"
 
 # --- cleanup ------------------------------------------------------------------
 rm -rf "$TMP_DIR"
+command -v stty >/dev/null 2>&1 && stty sane || true
