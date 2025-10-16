@@ -12,6 +12,7 @@ set -euo pipefail
 # - Optional per-prefix key diffs:
 #     * Missing in DST (SRC − DST)  -> missing_keys_<RUN_ID>_<PID>.log
 #     * Extras in DST  (DST − SRC)  -> extra_keys_<RUN_ID>_<PID>.log
+# - Serialized background printing to avoid TTY stalls (“press Enter to continue”)
 # ------------------------------------------------------------------------------
 
 # --- config -------------------------------------------------------------------
@@ -51,19 +52,6 @@ source ./awshelper.sh
 [[ -n "${SRC:-}" && -n "${DST:-}" ]] || { err "SRC and DST must be set (awshelper.sh)"; exit 1; }
 
 # --- utils --------------------------------------------------------------------
-# A tiny screen printer that serializes writes from background jobs
-SCREEN_LOCK="$TMP_DIR/.screen.lock"
-
-print_sync() {
-  local msg="$1"
-  {
-    flock 9
-    # write directly to the user's TTY so we don't fight with redirected stdout
-    printf "%s\n" "$msg" > /dev/tty
-  } 9>"$SCREEN_LOCK"
-}
-
-
 trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
 human_bytes() {
   local b="${1:-0}"
@@ -119,6 +107,17 @@ bg_gate() {
 list_next_level_prefixes() {
   local base_uri="$1"
   aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
+}
+
+# --- serialized screen printer to avoid TTY contention ------------------------
+SCREEN_LOCK="$TMP_DIR/.screen.lock"
+print_sync() {
+  local msg="$1"
+  {
+    flock 9
+    # write directly to terminal to avoid redirected stdout buffering
+    printf "%s\n" "$msg" > /dev/tty
+  } 9>"$SCREEN_LOCK"
 }
 
 # --- scope setup --------------------------------------------------------------
@@ -220,7 +219,6 @@ compare_one_prefix() {
 
   # --- Missing in DST (SRC − DST) with recheck + normalized diff ---------------
   if (( SRC_COUNT > DST_COUNT )) && [[ "$LIST_MISSING" = "1" ]]; then
-    # quick recheck to avoid transient mismatch
     read -r re_dc _ <<<"$(summarize_objects_and_bytes "$DST_URI")"
     if (( SRC_COUNT > re_dc )); then
       local SAFE_PFX="${PFX//\//__}"
@@ -267,14 +265,13 @@ compare_one_prefix() {
           sed -e "s#^#s3://${DST}/#" "$EXTRA_KEYS"
           echo
         } >> "$EXTRAS_LOG"
-        # printf "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
-        print_sync "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
+        printf "[extra-in-dst] %s  %s extra object(s) listed in %s\n" \
           "$PFX" "$(wc -l < "$EXTRA_KEYS" | tr -d ' ')" "$EXTRAS_LOG" >> "$LOG_FILE"
       fi
     fi
   fi
 
-  # printf "%s\n" "$LINE"
+  # print to screen (serialized)
   print_sync "$LINE"
 
   # per-job CSV
@@ -284,10 +281,9 @@ compare_one_prefix() {
     "$PFX" "$SRC_COUNT" "$SRC_BYTES" "$DST_COUNT" "$DST_BYTES" "$MATCH" > "$JOB_OUT"
 }
 
-# --- dispatch jobs ------------------------------------------------------------
+# --- dispatch jobs (detach stdin) --------------------------------------------
 for PFX in "${FILTERED[@]}"; do
   bg_gate
-  # compare_one_prefix "$PFX" &
   compare_one_prefix "$PFX" </dev/null &
 done
 wait
@@ -309,9 +305,9 @@ done < "$RES_FILE"
 # append to main CSV (already has header)
 cat "$RES_FILE" >> "$CSV_FILE"
 
-# --- summary ------------------------------------------------------------------
+# --- summary (foreground prints; can also use print_sync for consistency) -----
 echo
-printf "%sGrand Totals%s\n" "$BOLD" "$RESET"
+echo "Grand Totals"
 printf "  SRC objects: %12d   (%s)\n" "$TOTAL_SRC_OBJS" "$(human_bytes "$TOTAL_SRC_BYTES")"
 printf "  DST objects: %12d   (%s)\n" "$TOTAL_DST_OBJS" "$(human_bytes "$TOTAL_DST_BYTES")"
 
@@ -338,4 +334,5 @@ printf "\nCSV:  %s\nLOG:  %s\n" "$CSV_FILE" "$LOG_FILE"
 
 # --- cleanup ------------------------------------------------------------------
 rm -rf "$TMP_DIR"
+# ensure terminal is sane even if a tool messed with it
 command -v stty >/dev/null 2>&1 && stty sane || true
