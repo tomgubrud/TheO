@@ -69,13 +69,33 @@ summarize_count_bytes() {
   echo "$(safe_number "$objs") $(safe_number "$bytes")"
 }
 
+# Robustly extract first-level prefixes (P1) from `aws s3 ls` output.
+# Handles lines with/without indentation, ignores file rows.
 list_p1_prefixes() {
   local base_uri="$1"
-  # Expect lines like: "                           PRE prefix_name/"
-  # Extract "prefix_name" safely; ignore anything not matching.
-  aws s3 ls "$base_uri" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*PRE[[:space:]]\+\([^/]*\)\/[[:space:]]*$/\1/p'
+  local out
+  # Never let a transient CLI non-zero kill the caller
+  out="$(aws s3 ls "$base_uri" 2>/dev/null || true)"
+
+  # Parse in pure bash to avoid awk/pipefail surprises
+  local line name
+  while IFS= read -r line; do
+    # Accept formats like:
+    #   "                           PRE name/"
+    #   "PRE name/"
+    # Ignore any non-PRE rows (file listings)
+    case "$line" in
+      *" PRE "*"/" | "PRE "*"/")
+        # strip everything up to the last " PRE " or start-of-line "PRE "
+        name="${line##* PRE }"
+        name="${name#PRE }"
+        name="${name%/}"
+        printf '%s\n' "$name"
+        ;;
+    esac
+  done <<<"$out"
 }
+
 
 gate_local() { # limit concurrency within a queue controller
   local limit="${1:-0}"
@@ -122,10 +142,13 @@ echo "------------------------------------------------------------"
 
 # ---- list candidates ---------------------------------------------------------
 echo "[scan] Listing P1 under: ${SRC_BASE_URI}"
+
 ALL_P1=()
-# Temporarily relax pipefail so an empty/odd pipeline won't abort the script
+# Temporarily relax pipefail so an empty/odd listing won't abort the script
 set +o pipefail
-if ! mapfile -t ALL_P1 < <(list_p1_prefixes "$SRC_BASE_URI"); then
+if mapfile -t ALL_P1 < <(list_p1_prefixes "$SRC_BASE_URI"); then
+  :
+else
   ALL_P1=()
 fi
 set -o pipefail
@@ -140,10 +163,12 @@ done
 
 if ((${#CAND[@]}==0)); then
   echo "[WARN] No P1 prefixes found under ${SRC_BASE_URI} (filter='${FILTER}')."
-  echo "       Try: aws s3 ls '${SRC_BASE_URI}'  # to verify listing output"
+  echo "       First few ls lines to help debug:"
+  aws s3 ls "${SRC_BASE_URI}" 2>/dev/null | sed -n '1,10p' || true
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
+
 
 # ---- peek + classify ---------------------------------------------------------
 declare -A SRC_OBJS SRC_BYTES PCLASS
