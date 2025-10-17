@@ -71,30 +71,50 @@ summarize_count_bytes() {
 
 # Robustly extract first-level prefixes (P1) from `aws s3 ls` output.
 # Handles lines with/without indentation, ignores file rows.
-list_p1_prefixes() {
-  local base_uri="$1"
-  local out
-  # Never let a transient CLI non-zero kill the caller
-  out="$(aws s3 ls "$base_uri" 2>/dev/null || true)"
+# Return first-level prefixes under BASE (or bucket root if BASE empty),
+# using the S3 API with delimiter='/'. No jq required.
+list_p1_prefixes_api() {
+  local bucket="$SRC"
+  local base="${BASE:-}"
+  local prefix=""
+  [[ -n "$base" ]] && prefix="${base%/}/"
 
-  # Parse in pure bash to avoid awk/pipefail surprises
-  local line name
-  while IFS= read -r line; do
-    # Accept formats like:
-    #   "                           PRE name/"
-    #   "PRE name/"
-    # Ignore any non-PRE rows (file listings)
-    case "$line" in
-      *" PRE "*"/" | "PRE "*"/")
-        # strip everything up to the last " PRE " or start-of-line "PRE "
-        name="${line##* PRE }"
-        name="${name#PRE }"
-        name="${name%/}"
-        printf '%s\n' "$name"
-        ;;
-    esac
-  done <<<"$out"
+  local token=""
+  local lines=()
+
+  while : ; do
+    # Build args (avoid passing empty values)
+    local args=(s3api list-objects-v2 --bucket "$bucket" --delimiter '/')
+    [[ -n "$prefix" ]] && args+=(--prefix "$prefix")
+    [[ -n "$token"  ]] && args+=(--continuation-token "$token")
+
+    # We ask only for CommonPrefixes (i.e., "directories")
+    # Output: one full prefix per line, e.g. "staged/2024-06-28/"
+    local out
+    out="$(aws "${args[@]}" \
+      --query 'CommonPrefixes[].Prefix' \
+      --output text 2>/dev/null || true)"
+
+    # Collect lines if any
+    if [[ -n "$out" ]]; then
+      while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        # strip the BASE and trailing slash to get the P1 component
+        # e.g., "staged/2024-06-28/" -> "2024-06-28"
+        local rest="${p#${prefix}}"
+        rest="${rest%/}"
+        printf '%s\n' "$rest"
+      done <<<"$out"
+    fi
+
+    # Check pagination
+    token="$(aws "${args[@]}" \
+      --query 'NextContinuationToken' \
+      --output text 2>/dev/null || true)"
+    [[ "$token" == "None" || -z "$token" ]] && break
+  done
 }
+
 
 
 gate_local() { # limit concurrency within a queue controller
@@ -144,30 +164,32 @@ echo "------------------------------------------------------------"
 echo "[scan] Listing P1 under: ${SRC_BASE_URI}"
 
 ALL_P1=()
-# Temporarily relax pipefail so an empty/odd listing won't abort the script
+# Tolerate empty pages / transient cli errors without aborting the script
 set +o pipefail
-if mapfile -t ALL_P1 < <(list_p1_prefixes "$SRC_BASE_URI"); then
-  :
-else
-  ALL_P1=()
-fi
+if mapfile -t ALL_P1 < <(list_p1_prefixes_api); then :; else ALL_P1=(); fi
 set -o pipefail
 
 CAND=()
 for p in "${ALL_P1[@]}"; do
-  p="${p%/}"
-  if [[ -z "$FILTER" || "${p,,}" == *"${FILTER,,}"* ]]; then
+  # filter match (case-insensitive) if COMPARE_FILTER/--filter provided
+  if [[ -z "${FILTER:-}" || "${p,,}" == *"${FILTER,,}"* ]]; then
     CAND+=("$p")
   fi
 done
 
 if ((${#CAND[@]}==0)); then
-  echo "[WARN] No P1 prefixes found under ${SRC_BASE_URI} (filter='${FILTER}')."
-  echo "       First few ls lines to help debug:"
-  aws s3 ls "${SRC_BASE_URI}" 2>/dev/null | sed -n '1,10p' || true
+  echo "[WARN] No P1 prefixes found under ${SRC_BASE_URI} (filter='${FILTER:-}')."
+  echo "       Quick check:"
+  echo "         aws s3api list-objects-v2 --bucket \"$SRC\" --delimiter '/' \\"
+  if [[ -n "${BASE:-}" ]]; then
+    echo "            --prefix '${BASE%/}/' --query 'CommonPrefixes[].Prefix' --output text"
+  else
+    echo "            --query 'CommonPrefixes[].Prefix' --output text"
+  fi
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
+
 
 
 # ---- peek + classify ---------------------------------------------------------
