@@ -71,7 +71,10 @@ summarize_count_bytes() {
 
 list_p1_prefixes() {
   local base_uri="$1"
-  aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
+  # Expect lines like: "                           PRE prefix_name/"
+  # Extract "prefix_name" safely; ignore anything not matching.
+  aws s3 ls "$base_uri" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*PRE[[:space:]]\+\([^/]*\)\/[[:space:]]*$/\1/p'
 }
 
 gate_local() { # limit concurrency within a queue controller
@@ -119,7 +122,13 @@ echo "------------------------------------------------------------"
 
 # ---- list candidates ---------------------------------------------------------
 echo "[scan] Listing P1 under: ${SRC_BASE_URI}"
-mapfile -t ALL_P1 < <(list_p1_prefixes "$SRC_BASE_URI")
+ALL_P1=()
+# Temporarily relax pipefail so an empty/odd pipeline won't abort the script
+set +o pipefail
+if ! mapfile -t ALL_P1 < <(list_p1_prefixes "$SRC_BASE_URI"); then
+  ALL_P1=()
+fi
+set -o pipefail
 
 CAND=()
 for p in "${ALL_P1[@]}"; do
@@ -130,7 +139,8 @@ for p in "${ALL_P1[@]}"; do
 done
 
 if ((${#CAND[@]}==0)); then
-  echo "[WARN] No P1 prefixes matched filter '${FILTER}'. Exiting."
+  echo "[WARN] No P1 prefixes found under ${SRC_BASE_URI} (filter='${FILTER}')."
+  echo "       Try: aws s3 ls '${SRC_BASE_URI}'  # to verify listing output"
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
