@@ -2,11 +2,10 @@
 set -euo pipefail
 
 # ==============================================================================
-# syncs3.sh (v5.6)
-# - Per-P1 dispatcher with background jobs, copy deltas, and master CSV
-# - Plan line shows only counts + concurrency "5/3/10 (H/M/L)"
-# - Runs H/M/L queues concurrently under the hood
-# - Kills straggler children on exit and exits cleanly (no hang)
+# syncs3.sh (v5.7)
+# - Concurrent per-P1 sync with background queues
+# - Clean plan/run output (no class names)
+# - Summary uses pure bash (no awk), and we hard-stop any straggler children
 # ==============================================================================
 
 LOG_DIR="${LOG_DIR:-./logs}"
@@ -20,10 +19,7 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 START_TS="$(date +%s)"
 MASTER_CSV="$LOG_DIR/sync_${RUN_ID}_deltas.csv"
 
-# Ensure any orphaned children are cleaned up so we never “hang” at the end.
-trap 'jobs -pr | xargs -r kill 2>/dev/null || true' EXIT
-
-# ---- colors ------------------------------------------------------------------
+# ---- colors (optional) -------------------------------------------------------
 if [[ -t 1 ]]; then
   GREEN="$(tput setaf 2 || true)"; RED="$(tput setaf 1 || true)"; YEL="$(tput setaf 3 || true)"
   BOLD="$(tput bold || true)"; RESET="$(tput sgr0 || true)"
@@ -43,25 +39,33 @@ source ./awshelper.sh
 trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
 safe_number()  { [[ "${1:-}" =~ ^-?[0-9]+$ ]] && echo "$1" || echo 0; }
 
+# human_bytes: pure bash, no awk
 human_bytes() {
-  local b="${1:-0}"
-  awk -v b="$b" 'function p(x,u){printf "%.2f %s",x,u}
-    b<1024{p(b,"B");exit}
-    b<1048576{p(b/1024,"KiB");exit}
-    b<1073741824{p(b/1048576,"MiB");exit}
-    b<1099511627776{p(b/1073741824,"GiB");exit}
-    {p(b/1099511627776,"TiB")}'
+  local b="${1:-0}" units=(B KiB MiB GiB TiB PiB) i=0
+  while (( b >= 1024 && i < ${#units[@]}-1 )); do
+    # integer "rounding" using 2 decimals: scale via *100 then /1024
+    local next=$(( (b * 100 + 512) / 1024 ))
+    b=$(( next ))
+    (( i++ ))
+  done
+  # place decimal point for scaled units
+  if (( i == 0 )); then
+    printf "%d %s" "$b" "${units[i]}"
+  else
+    printf "%d.%02d %s" $((b/100)) $((b%100)) "${units[i]}"
+  fi
 }
 
 summarize_count_bytes() {
+  # echoes: "<count> <bytes>" (0 0 on error)
   local uri="$1" out rc objs bytes
   set +e
   out=$(aws s3 ls "$uri" --recursive --summarize 2>/dev/null)
   rc=$?
   set -e
   if (( rc != 0 )); then echo "0 0"; return; fi
-  objs=$(awk '/Total Objects:/ {print $3}' <<<"$out" | tail -n1)
-  bytes=$(awk '/Total Size:/ {print $3}'   <<<"$out" | tail -n1)
+  objs=$(printf "%s\n" "$out" | sed -n 's/^Total Objects:[[:space:]]*\([0-9]\+\).*$/\1/p' | tail -n1)
+  bytes=$(printf "%s\n" "$out" | sed -n 's/^Total Size:[[:space:]]*\([0-9]\+\).*$/\1/p' | tail -n1)
   echo "$(safe_number "$objs") $(safe_number "$bytes")"
 }
 
@@ -70,8 +74,7 @@ list_p1_prefixes() {
   aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
 }
 
-# Gate inside a queue controller (subshell-local jobs)
-gate_local() {
+gate_local() { # limit concurrency within a queue controller
   local limit="${1:-0}"
   if (( limit > 0 )); then
     while (( $(jobs -rp | wc -l) >= limit )); do sleep 0.2; done
@@ -156,7 +159,7 @@ for p in "${CAND[@]}"; do
   fi
 done
 
-# ---- plan (clean display) ----------------------------------------------------
+# ---- plan (simple) -----------------------------------------------------------
 echo "[plan] ${#CAND[@]} prefix(es); concurrency ${HEAVY_CONC}/${MED_CONC}/${LIGHT_CONC}  (H/M/L)"
 for p in "${CAND[@]}"; do printf "  - %s\n" "$p"; done
 echo
@@ -228,7 +231,7 @@ run_one_prefix() {
   return $rc
 }
 
-# ---- aggregation helpers -----------------------------------------------------
+# ---- aggregate helpers -------------------------------------------------------
 TOTAL_COPIED_OBJS=0
 TOTAL_COPIED_BYTES=0
 ALREADY_UP_TO_DATE=0
@@ -275,7 +278,7 @@ for p in "${HEAVY[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//
 for p in "${MED[@]}";   do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 for p in "${LIGHT[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 
-# ---- summary (no deep bucket scan) ------------------------------------------
+# ---- summary (all in bash) ---------------------------------------------------
 END_TS="$(date +%s)"
 ELAPSED=$(( END_TS - START_TS ))
 
@@ -296,6 +299,7 @@ echo " Logs:                          ${LOG_DIR}/sync_${RUN_ID}_<pfx>.raw.log  (
 echo " Master CSV:                    ${MASTER_CSV}"
 echo "==============================================================="
 
-# A last defensive wait (no-op if nothing is running), then exit cleanly.
-wait || true
+# ---- hard stop any stragglers, then exit cleanly ----------------------------
+pkill -P $$ 2>/dev/null || true
+for pid in $(jobs -pr); do wait "$pid" || true; done
 exit 0
