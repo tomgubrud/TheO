@@ -2,25 +2,11 @@
 set -euo pipefail
 
 # ==============================================================================
-# syncs3.sh (v5.3) — per-P1 dispatcher with background jobs + copy counts + CSV
-# ------------------------------------------------------------------------------
-# - Lists next-level prefixes (P1) under s3://$SRC/(BASE/)
-# - Optional substring filter (--filter or env COMPARE_FILTER)
-# - Classifies P1s by source object count:
-#       < 10 objs    -> LIGHT   (high concurrency)
-#       10..150 objs -> MEDIUM
-#       > 150 objs   -> HEAVY   (concurrency 5)
-# - Runs per-P1 sync: s3://SRC/(BASE/)P1 -> s3://DST/(BASE/)P1
-#     flags: --exclude '*$folder$' --exact-timestamps --size-only --no-progress --only-show-errors
-# - Computes copied deltas from DST pre/post totals; prints concise lines
-# - Emits per-prefix logs and a master CSV: logs/sync_<RUNID>_deltas.csv
-#
-# Requires:
-#   - ./awshelper.sh       (exports SRC, DST, optional BASE)
-#   - ./vault_keepalive.sh (keeps Vault token/lease fresh around long AWS calls)
-#
-# Knobs (env):
-#   LOG_DIR (./logs), LIGHT_CONC (10), MED_CONC (3), HEAVY_CONC (5), EXTRA_SYNC_ARGS ("")
+# syncs3.sh (v5.4)
+# - Per-P1 dispatcher with background jobs + copy deltas + master CSV
+# - Console output no longer shows class (LIGHT/MEDIUM/HEAVY)
+# - Heavy/Medium/Light queues run **concurrently** via controller subshells
+# - Robust waiting: we only wait for our own controllers (no stray job hangs)
 # ==============================================================================
 
 # ---- knobs -------------------------------------------------------------------
@@ -83,7 +69,8 @@ list_p1_prefixes() {
   aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
 }
 
-gate() {  # gate <limit>
+# Gate within a queue controller (uses subshell-local jobs)
+gate_local() {  # gate_local <limit>
   local limit="${1:-0}"
   if (( limit > 0 )); then
     while (( $(jobs -rp | wc -l) >= limit )); do sleep 0.2; done
@@ -143,12 +130,11 @@ done
 
 if ((${#CAND[@]}==0)); then
   echo "[WARN] No P1 prefixes matched filter '${FILTER}'. Exiting."
-  # still create empty CSV w/header so automation doesn't choke
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
 
-echo "[info] ${#CAND[@]} P1 candidate(s) matched filter '${FILTER}'"
+echo "[info] ${#CAND[@]} candidate(s) matched filter '${FILTER}'"
 for p in "${CAND[@]}"; do echo "  - $p"; done
 echo
 
@@ -191,7 +177,6 @@ if (( DRY_RUN == 1 )); then
       echo "  aws s3 sync s3://${SRC}/${p}  s3://${DST}/${p}  --exclude '*\$folder\$' --exact-timestamps --size-only --no-progress --only-show-errors"
     fi
   done
-  # header so tools can still ingest
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
@@ -199,7 +184,7 @@ fi
 # ---- init master CSV ---------------------------------------------------------
 echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
 
-# ---- per-prefix runner (with class + pre/post deltas) ------------------------
+# ---- per-prefix runner (class kept internal; not printed) --------------------
 run_one_prefix() {
   local p1="$1" class="$2"
   local src_uri dst_uri log_base raw_log err_log
@@ -218,7 +203,7 @@ run_one_prefix() {
   # pre-sync DST totals
   read -r dst_pre_objs dst_pre_bytes <<<"$(summarize_count_bytes "$dst_uri")"
 
-  echo "[run ] ${p1} (${class}) -> ${dst_uri}" | tee -a "$raw_log"
+  echo "[run ] ${p1} -> ${dst_uri}" | tee -a "$raw_log"
 
   # shellcheck disable=SC2086
   ./vault_keepalive.sh aws s3 sync "$src_uri" "$dst_uri" \
@@ -246,10 +231,9 @@ run_one_prefix() {
     echo "[FAIL] ${p1} (rc=${rc}) — see ${err_log}" | tee -a "$raw_log"
   fi
 
-  # store per-prefix delta for aggregation & for master CSV
+  # store per-prefix delta for aggregation & CSV
   printf "%s,%s,%s,%s,%s\n" "$p1" "$class" "$copied_objs" "$copied_bytes" "$rc" \
     | tee -a "$MASTER_CSV" > "${log_base}.delta.csv"
-
   return $rc
 }
 
@@ -269,20 +253,52 @@ aggregate_delta_csv() {
   if (( d_objs == 0 && d_bytes == 0 )); then (( ALREADY_UP_TO_DATE += 1 )); fi
 }
 
-# ---- run queues --------------------------------------------------------------
-echo "[run ] Dispatching HEAVY queue..."
-for p in "${HEAVY[@]}"; do gate "$HEAVY_CONC"; run_one_prefix "$p" "HEAVY" </dev/null & done
-wait
+# ---- queue controllers (run concurrently) -----------------------------------
+controller_pids=()
+
+if ((${#HEAVY[@]})); then
+  echo "[run ] Dispatching HEAVY queue..."
+  (
+    for p in "${HEAVY[@]}"; do
+      gate_local "$HEAVY_CONC"
+      run_one_prefix "$p" "HEAVY" </dev/null &
+    done
+    wait
+  ) & controller_pids+=("$!")
+fi
+
+if ((${#MED[@]})); then
+  echo "[run ] Dispatching MEDIUM queue..."
+  (
+    for p in "${MED[@]}"; do
+      gate_local "$MED_CONC"
+      run_one_prefix "$p" "MEDIUM" </dev/null &
+    done
+    wait
+  ) & controller_pids+=("$!")
+fi
+
+if ((${#LIGHT[@]})); then
+  echo "[run ] Dispatching LIGHT queue..."
+  (
+    for p in "${LIGHT[@]}"; do
+      gate_local "$LIGHT_CONC"
+      run_one_prefix "$p" "LIGHT" </dev/null &
+    done
+    wait
+  ) & controller_pids+=("$!")
+fi
+
+# If nothing to do (should be rare), still continue to summary
+if ((${#controller_pids[@]})); then
+  for pid in "${controller_pids[@]}"; do
+    wait "$pid"
+  done
+fi
+
+# Aggregate results
 for p in "${HEAVY[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
-
-echo "[run ] Dispatching MEDIUM queue..."
-for p in "${MED[@]}"; do gate "$MED_CONC"; run_one_prefix "$p" "MEDIUM" </dev/null & done
-wait
-for p in "${MED[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
-
-echo "[run ] Dispatching LIGHT queue..."
-for p in "${LIGHT[@]}"; do gate "$LIGHT_CONC"; run_one_prefix "$p" "LIGHT" </dev/null & done
-wait
+for p in "${MED[@]}";   do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 for p in "${LIGHT[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 
 # ---- summary ----------------------------------------------------------------
