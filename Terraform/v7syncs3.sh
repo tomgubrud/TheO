@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ==============================================================================
-# syncs3.sh (v5.4)
-# - Per-P1 dispatcher with background jobs + copy deltas + master CSV
-# - Console output no longer shows class (LIGHT/MEDIUM/HEAVY)
-# - Heavy/Medium/Light queues run **concurrently** via controller subshells
-# - Robust waiting: we only wait for our own controllers (no stray job hangs)
+# syncs3.sh (v5.5)
+# Per-P1 dispatcher with background jobs, copy deltas, and master CSV.
+# - Hides queue class in console; still used internally and in CSV.
+# - Runs heavy/medium/light queues concurrently.
+# - NO full-bucket recursive ls at the end (prevents “hang”).
 # ==============================================================================
 
 # ---- knobs -------------------------------------------------------------------
@@ -82,21 +82,12 @@ BASE="$(trim_slashes "${BASE:-}")"
 if [[ -n "$BASE" ]]; then
   SRC_BASE_URI="s3://${SRC}/${BASE}/"
   DST_BASE_URI="s3://${DST}/${BASE}/"
-  MODE="BASE=${BASE}"
+  BASE_DESC="BASE=${BASE}"
 else
   SRC_BASE_URI="s3://${SRC}/"
   DST_BASE_URI="s3://${DST}/"
-  MODE="FULL BUCKET"
+  BASE_DESC="FULL BUCKET (all P1s)"
 fi
-
-echo "------------------------------------------------------------"
-echo " Sync dispatcher"
-echo " Source:       ${SRC_BASE_URI}"
-echo " Destination:  ${DST_BASE_URI}"
-echo " Mode:         ${MODE}"
-echo " Logs:         ${LOG_DIR}/sync_${RUN_ID}_<pfx>.raw.log / .err.log"
-echo " Master CSV:   ${MASTER_CSV}"
-echo "------------------------------------------------------------"
 
 # ---- parse flags / filter ----------------------------------------------------
 FILTER="${COMPARE_FILTER:-}"
@@ -110,11 +101,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${FILTER:-}" && -t 0 && -t 1 ]]; then
-  printf "Enter any part of the next-level prefix to sync (e.g., 2021, myfolder): "
-  IFS= read -r FILTER || FILTER=""
-  echo
+MODE_DESC="$BASE_DESC"
+if [[ -n "$FILTER" ]]; then
+  MODE_DESC="$BASE_DESC; FILTER='${FILTER}'"
 fi
+
+echo "------------------------------------------------------------"
+echo " Sync dispatcher"
+echo " Source:       ${SRC_BASE_URI}"
+echo " Destination:  ${DST_BASE_URI}"
+echo " Mode:         ${MODE_DESC}"
+echo " Logs:         ${LOG_DIR}/sync_${RUN_ID}_<pfx>.raw.log / .err.log"
+echo " Master CSV:   ${MASTER_CSV}"
+echo "------------------------------------------------------------"
 
 # ---- list candidate P1s ------------------------------------------------------
 echo "[scan] Listing P1 under: ${SRC_BASE_URI}"
@@ -133,10 +132,6 @@ if ((${#CAND[@]}==0)); then
   echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
   exit 0
 fi
-
-echo "[info] ${#CAND[@]} candidate(s) matched filter '${FILTER}'"
-for p in "${CAND[@]}"; do echo "  - $p"; done
-echo
 
 # ---- peek counts on SRC & classify ------------------------------------------
 declare -A SRC_OBJS SRC_BYTES PCLASS
@@ -162,9 +157,11 @@ for p in "${CAND[@]}"; do
   fi
 done
 
-echo "[plan] heavy: ${#HEAVY[@]}  (limit ${HEAVY_CONC})"
-echo "[plan] medium: ${#MED[@]}   (limit ${MED_CONC})"
-echo "[plan] light: ${#LIGHT[@]}   (limit ${LIGHT_CONC})"
+# ---- plan (no class shown) ---------------------------------------------------
+echo "[plan] ${#CAND[@]} prefix(es); concurrency heavy=${HEAVY_CONC}, medium=${MED_CONC}, light=${LIGHT_CONC}"
+for p in "${CAND[@]}"; do
+  printf "  - %s\n" "$p"
+done
 echo
 
 # ---- dry-run preview ---------------------------------------------------------
@@ -184,7 +181,7 @@ fi
 # ---- init master CSV ---------------------------------------------------------
 echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
 
-# ---- per-prefix runner (class kept internal; not printed) --------------------
+# ---- per-prefix runner -------------------------------------------------------
 run_one_prefix() {
   local p1="$1" class="$2"
   local src_uri dst_uri log_base raw_log err_log
@@ -203,7 +200,7 @@ run_one_prefix() {
   # pre-sync DST totals
   read -r dst_pre_objs dst_pre_bytes <<<"$(summarize_count_bytes "$dst_uri")"
 
-  echo "[run ] ${p1} -> ${dst_uri}" | tee -a "$raw_log"
+  echo "[run] ${p1} -> ${dst_uri}" | tee -a "$raw_log"
 
   # shellcheck disable=SC2086
   ./vault_keepalive.sh aws s3 sync "$src_uri" "$dst_uri" \
@@ -223,15 +220,14 @@ run_one_prefix() {
 
   if (( rc == 0 )); then
     if (( copied_objs > 0 || copied_bytes > 0 )); then
-      echo "[done] ${p1}  copied: ${copied_objs} objs ($(human_bytes "$copied_bytes"))" | tee -a "$raw_log"
+      echo "[done] ${p1} copied: ${copied_objs} objs ($(human_bytes "$copied_bytes"))" | tee -a "$raw_log"
     else
-      echo "[done] ${p1}  already up-to-date" | tee -a "$raw_log"
+      echo "[done] ${p1} already up-to-date" | tee -a "$raw_log"
     fi
   else
     echo "[FAIL] ${p1} (rc=${rc}) — see ${err_log}" | tee -a "$raw_log"
   fi
 
-  # store per-prefix delta for aggregation & CSV
   printf "%s,%s,%s,%s,%s\n" "$p1" "$class" "$copied_objs" "$copied_bytes" "$rc" \
     | tee -a "$MASTER_CSV" > "${log_base}.delta.csv"
   return $rc
@@ -253,69 +249,50 @@ aggregate_delta_csv() {
   if (( d_objs == 0 && d_bytes == 0 )); then (( ALREADY_UP_TO_DATE += 1 )); fi
 }
 
-# ---- queue controllers (run concurrently) -----------------------------------
+# ---- queue controllers (concurrent) ------------------------------------------
 controller_pids=()
 
+echo "[run] Dispatching concurrent sync jobs..."
 if ((${#HEAVY[@]})); then
-  echo "[run ] Dispatching HEAVY queue..."
   (
-    for p in "${HEAVY[@]}"; do
-      gate_local "$HEAVY_CONC"
-      run_one_prefix "$p" "HEAVY" </dev/null &
-    done
+    for p in "${HEAVY[@]}"; do gate_local "$HEAVY_CONC"; run_one_prefix "$p" "HEAVY" </dev/null & done
     wait
   ) & controller_pids+=("$!")
 fi
-
 if ((${#MED[@]})); then
-  echo "[run ] Dispatching MEDIUM queue..."
   (
-    for p in "${MED[@]}"; do
-      gate_local "$MED_CONC"
-      run_one_prefix "$p" "MEDIUM" </dev/null &
-    done
+    for p in "${MED[@]}"; do gate_local "$MED_CONC"; run_one_prefix "$p" "MEDIUM" </dev/null & done
     wait
   ) & controller_pids+=("$!")
 fi
-
 if ((${#LIGHT[@]})); then
-  echo "[run ] Dispatching LIGHT queue..."
   (
-    for p in "${LIGHT[@]}"; do
-      gate_local "$LIGHT_CONC"
-      run_one_prefix "$p" "LIGHT" </dev/null &
-    done
+    for p in "${LIGHT[@]}"; do gate_local "$LIGHT_CONC"; run_one_prefix "$p" "LIGHT" </dev/null & done
     wait
   ) & controller_pids+=("$!")
 fi
 
-# If nothing to do (should be rare), still continue to summary
-if ((${#controller_pids[@]})); then
-  for pid in "${controller_pids[@]}"; do
-    wait "$pid"
-  done
-fi
+for pid in "${controller_pids[@]:-}"; do
+  wait "$pid"
+done
 
 # Aggregate results
 for p in "${HEAVY[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 for p in "${MED[@]}";   do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 for p in "${LIGHT[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 
-# ---- summary ----------------------------------------------------------------
-read -r BUCKET_TOTAL_OBJS BUCKET_TOTAL_BYTES <<<"$(summarize_count_bytes "$SRC_BASE_URI")"
+# ---- summary (no full-bucket ls) --------------------------------------------
 END_TS="$(date +%s)"
 ELAPSED=$(( END_TS - START_TS ))
 
 echo
 echo "==================== Summary (RUN ${RUN_ID}) ===================="
-printf " Bucket/Base total (SRC):   %12d  (%s)\n" \
-       "$BUCKET_TOTAL_OBJS" "$(human_bytes "$BUCKET_TOTAL_BYTES")"
-printf " Selected P1s total (SRC):  %12d  (%s)\n" \
+printf " Selected P1 total (SRC peek): %12d  (%s)\n" \
        "$TOTAL_SELECTED_OBJS" "$(human_bytes "$TOTAL_SELECTED_BYTES")"
 echo
-printf " Total copied (DST delta):  %12d  (%s)\n" \
+printf " Total copied (DST delta):     %12d  (%s)\n" \
        "$TOTAL_COPIED_OBJS" "$(human_bytes "$TOTAL_COPIED_BYTES")"
-printf " Already up-to-date P1s:    %12d  / %d\n" \
+printf " Already up-to-date P1s:       %12d  / %d\n" \
        "$ALREADY_UP_TO_DATE" "${#CAND[@]}"
 echo
 printf " Jobs dispatched:  heavy=%d  medium=%d  light=%d\n" \
