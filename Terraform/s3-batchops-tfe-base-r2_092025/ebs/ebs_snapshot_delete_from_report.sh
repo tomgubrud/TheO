@@ -24,6 +24,16 @@ FORCE_DELETE="N"
 REGIONS="$REGIONS_DEFAULT"
 CSV_PATH=""
 
+aws_capture() {
+  set +e
+  local output
+  output=$(aws "$@" 2>>"$LOG_FILE")
+  local status=$?
+  set -e
+  printf '%s' "$output"
+  return $status
+}
+
 log(){
   local message="$1"
   echo "$message"
@@ -159,9 +169,7 @@ CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
 while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
   LINE="${LINE//$'\r'/}"
   [[ -z "$LINE" ]] && continue
-  log "[DEBUG] raw candidate line: $LINE"
   IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG <<< "$LINE"
-  log "[DEBUG] parsed -> region=$REGION snapshot=$SNAPSHOT"
 
   # Trim any stray whitespace that could have slipped through (defensive)
   REGION="${REGION#"${REGION%%[![:space:]]*}"}"; REGION="${REGION%"${REGION##*[![:space:]]}"}"
@@ -175,11 +183,11 @@ while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
   log "[$(date)] [$CNT/$TOTAL] Snapshot $SNAPSHOT in $REGION (CSV AMI: ${CSV_AMI:-none})"
 
   SNAP_INFO=""
-  if ! SNAP_INFO=$(aws ec2 describe-snapshots \
+  if ! SNAP_INFO=$(aws_capture ec2 describe-snapshots \
       --region "$REGION" \
       --snapshot-ids "$SNAPSHOT" \
       --query "Snapshots[0].[State,StartTime,VolumeId,VolumeSize]" \
-      --output text 2>>"$LOG_FILE"); then
+      --output text); then
     log "[$(date)] Snapshot $SNAPSHOT not found or access denied. Skipping."
     echo "$REGION $SNAPSHOT missing_or_denied" >> "$SKIP_FILE"
     ((SKIP++)); ((MISSING++))
@@ -194,11 +202,11 @@ while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
     continue
   fi
 
-  AMI_CHECK=$(aws ec2 describe-images \
+  AMI_CHECK=$(aws_capture ec2 describe-images \
     --region "$REGION" \
     --filters "Name=block-device-mapping.snapshot-id,Values=$SNAPSHOT" \
     --query "Images[].ImageId" \
-    --output text 2>>"$LOG_FILE" || true)
+    --output text || true)
   AMI_CHECK=$(echo "$AMI_CHECK" | tr '\t' '\n' | sed '/^None$/d' | sed '/^$/d' | tr '\n' ' ')
   AMI_CHECK=$(echo "$AMI_CHECK" | sed 's/[[:space:]]*$//')
 
@@ -219,7 +227,7 @@ while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
     continue
   fi
 
-  if DEL_OUT=$($CMD 2>&1); then
+  if DEL_OUT=$(aws_capture ec2 delete-snapshot --region "$REGION" --snapshot-id "$SNAPSHOT"); then
     log "[$(date)] Deleted snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)."
     echo "$REGION $SNAPSHOT deleted size:${SNAP_SIZE:-unknown} start:$SNAP_ACTUAL_START" >> "$SUCCESS_FILE"
     ((SUCC++))

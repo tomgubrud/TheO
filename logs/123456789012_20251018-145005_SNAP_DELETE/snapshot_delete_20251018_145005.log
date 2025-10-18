@@ -1,0 +1,15 @@
+[Sat Oct 18 14:50:05 CDT 2025] Mode: LIVE
+[Sat Oct 18 14:50:05 CDT 2025] AWS Account: 123456789012
+[Sat Oct 18 14:50:05 CDT 2025] Using CSV: /tmp/test.csv
+[Sat Oct 18 14:50:05 CDT 2025] CSV rows with SafeToDeregister=YES: 1
+[Sat Oct 18 14:50:05 CDT 2025] Unique snapshots flagged in CSV: 1
+[Sat Oct 18 14:50:05 CDT 2025] Region filter: us-east-2 us-west-2
+[Sat Oct 18 14:50:05 CDT 2025] Force delete on referenced snapshots: N
+[Sat Oct 18 14:50:05 CDT 2025] Candidate snapshots to evaluate: 1
+[Sat Oct 18 14:50:05 CDT 2025] [1/1] Snapshot snap-good in us-east-2 (CSV AMI: none)
+[Sat Oct 18 14:50:05 CDT 2025] Deleted snapshot snap-good (8 GiB, started 2020-01-01T00:00:00Z).
+------ Summary ------
+Candidates evaluated: 1
+Deleted (or dry-run ready): 1
+Skipped total: 0 | - Missing: 0 | - State != completed: 0 | - Referenced AMIs: 0
+Failures: 0
