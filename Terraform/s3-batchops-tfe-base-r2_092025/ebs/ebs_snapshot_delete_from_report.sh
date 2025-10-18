@@ -165,8 +165,10 @@ fi
 
 log "[$(date)] Candidate snapshots to evaluate: $TOTAL"
 
+mapfile -t CANDIDATE_LINES < "$CANDIDATES"
+
 CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
-while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
+for LINE in "${CANDIDATE_LINES[@]}"; do
   LINE="${LINE//$'\r'/}"
   [[ -z "$LINE" ]] && continue
   IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG <<< "$LINE"
@@ -236,7 +238,7 @@ while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
     echo "$CMD => $DEL_OUT" >> "$FAIL_FILE"
     ((FAIL++))
   fi
-done < "$CANDIDATES"
+done
 
 log "------ Summary ------"
 log "Candidates evaluated: $TOTAL"
