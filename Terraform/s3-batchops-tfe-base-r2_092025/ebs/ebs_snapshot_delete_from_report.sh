@@ -24,6 +24,12 @@ FORCE_DELETE="N"
 REGIONS="$REGIONS_DEFAULT"
 CSV_PATH=""
 
+log(){
+  local message="$1"
+  echo "$message"
+  printf '%s\n' "$message" >>"$LOG_FILE"
+}
+
 usage() {
   cat <<EOF
 Usage: $0 [--csv PATH] [--regions "us-east-2 us-west-2" | --regions ALL] [--force]
@@ -72,24 +78,24 @@ done
 
 read -p "Enable dry-run mode (no actual deletions)? (y/n): " DRY_RUN
 MODE=$([[ "$DRY_RUN" =~ ^[Yy] ]] && echo "DRY-RUN" || echo "LIVE")
-echo "[$(date)] Mode: $MODE" | tee -a "$LOG_FILE"
+log "[$(date)] Mode: $MODE"
 
 if [[ -z "$CSV_PATH" ]]; then
   read -p "Path to CSV from ebs-snapshot-ami-usage.sh: " CSV_PATH
 fi
 if [[ ! -f "$CSV_PATH" ]]; then
-  echo "ERROR: CSV not found: $CSV_PATH" | tee -a "$LOG_FILE"
+  log "ERROR: CSV not found: $CSV_PATH"
   exit 1
 fi
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>>"$LOG_FILE" || echo "unknown")
-echo "[$(date)] AWS Account: $ACCOUNT_ID" | tee -a "$LOG_FILE"
-echo "[$(date)] Using CSV: $CSV_PATH" | tee -a "$LOG_FILE"
+log "[$(date)] AWS Account: $ACCOUNT_ID"
+log "[$(date)] Using CSV: $CSV_PATH"
 
 SAFE_ROWS=$(awk -F',' 'NR>1 && toupper($7) ~ /YES/' "$CSV_PATH" | wc -l | awk '{print $1}')
 SAFE_UNIQUE=$(awk -F',' 'NR>1 && toupper($7) ~ /YES/ && $2 != "" {gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' "$CSV_PATH" | sort -u | wc -l | awk '{print $1}')
-echo "[$(date)] CSV rows with SafeToDeregister=YES: $SAFE_ROWS" | tee -a "$LOG_FILE"
-echo "[$(date)] Unique snapshots flagged in CSV: $SAFE_UNIQUE" | tee -a "$LOG_FILE"
+log "[$(date)] CSV rows with SafeToDeregister=YES: $SAFE_ROWS"
+log "[$(date)] Unique snapshots flagged in CSV: $SAFE_UNIQUE"
 
 REGION_FILTER="$REGIONS"
 if [[ -n "$REGION_FILTER" ]]; then
@@ -99,11 +105,11 @@ if [[ -n "$REGION_FILTER" ]]; then
   fi
 fi
 if [[ -z "$REGION_FILTER" ]]; then
-  echo "[$(date)] Region filter: ALL regions in CSV" | tee -a "$LOG_FILE"
+  log "[$(date)] Region filter: ALL regions in CSV"
 else
-  echo "[$(date)] Region filter: $REGION_FILTER" | tee -a "$LOG_FILE"
+  log "[$(date)] Region filter: $REGION_FILTER"
 fi
-echo "[$(date)] Force delete on referenced snapshots: $FORCE_DELETE" | tee -a "$LOG_FILE"
+log "[$(date)] Force delete on referenced snapshots: $FORCE_DELETE"
 
 CANDIDATES="$TMP_DIR/snapshot_candidates_${DATE_TAG}.txt"; : >"$CANDIDATES"
 awk -F',' -v region_filter="$REGION_FILTER" '
@@ -142,11 +148,11 @@ NR > 1 {
 
 TOTAL=$(wc -l < "$CANDIDATES" | awk '{print $1}')
 if [[ "$TOTAL" -eq 0 ]]; then
-  echo "[$(date)] No snapshots matched SafeToDeregister=YES under the current filters. Exiting." | tee -a "$LOG_FILE"
+  log "[$(date)] No snapshots matched SafeToDeregister=YES under the current filters. Exiting."
   exit 0
 fi
 
-echo "[$(date)] Candidate snapshots to evaluate: $TOTAL" | tee -a "$LOG_FILE"
+log "[$(date)] Candidate snapshots to evaluate: $TOTAL"
 
 CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
 while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG; do
@@ -159,7 +165,7 @@ while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNC
   SNAP_START="${SNAP_START#"${SNAP_START%%[![:space:]]*}"}"; SNAP_START="${SNAP_START%"${SNAP_START##*[![:space:]]}"}"
 
   ((CNT++))
-  echo "[$(date)] [$CNT/$TOTAL] Snapshot $SNAPSHOT in $REGION (CSV AMI: ${CSV_AMI:-none})" | tee -a "$LOG_FILE"
+  log "[$(date)] [$CNT/$TOTAL] Snapshot $SNAPSHOT in $REGION (CSV AMI: ${CSV_AMI:-none})"
 
   SNAP_INFO=""
   if ! SNAP_INFO=$(aws ec2 describe-snapshots \
@@ -167,7 +173,7 @@ while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNC
       --snapshot-ids "$SNAPSHOT" \
       --query "Snapshots[0].[State,StartTime,VolumeId,VolumeSize]" \
       --output text 2>>"$LOG_FILE"); then
-    echo "[$(date)] Snapshot $SNAPSHOT not found or access denied. Skipping." | tee -a "$LOG_FILE"
+    log "[$(date)] Snapshot $SNAPSHOT not found or access denied. Skipping."
     echo "$REGION $SNAPSHOT missing_or_denied" >> "$SKIP_FILE"
     ((SKIP++)); ((MISSING++))
     continue
@@ -175,7 +181,7 @@ while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNC
 
   read -r SNAP_STATE SNAP_ACTUAL_START SNAP_VOLUME SNAP_SIZE <<< "$SNAP_INFO"
   if [[ "$SNAP_STATE" != "completed" ]]; then
-    echo "[$(date)] SKIP: Snapshot state is $SNAP_STATE (needs completed)." | tee -a "$LOG_FILE"
+    log "[$(date)] SKIP: Snapshot state is $SNAP_STATE (needs completed)."
     echo "$REGION $SNAPSHOT state:$SNAP_STATE" >> "$SKIP_FILE"
     ((SKIP++)); ((STATE_SKIP++))
     continue
@@ -190,7 +196,7 @@ while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNC
   AMI_CHECK=$(echo "$AMI_CHECK" | sed 's/[[:space:]]*$//')
 
   if [[ -n "$AMI_CHECK" && "$FORCE_DELETE" != "Y" ]]; then
-    echo "[$(date)] SKIP: Snapshot is still referenced by AMI(s): $AMI_CHECK" | tee -a "$LOG_FILE"
+    log "[$(date)] SKIP: Snapshot is still referenced by AMI(s): $AMI_CHECK"
     echo "$REGION $SNAPSHOT referenced_by:$AMI_CHECK" >> "$SKIP_FILE"
     ((SKIP++)); ((REFER++))
     continue
@@ -200,28 +206,28 @@ while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNC
   echo "$CMD" >> "$DRY_FILE"
 
   if [[ "$MODE" == "DRY-RUN" ]]; then
-    echo "[$(date)] DRY-RUN: Would delete snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)." | tee -a "$LOG_FILE"
+    log "[$(date)] DRY-RUN: Would delete snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)."
     echo "$REGION $SNAPSHOT dry-run size:${SNAP_SIZE:-unknown} start:$SNAP_ACTUAL_START" >> "$SUCCESS_FILE"
     ((SUCC++))
     continue
   fi
 
   if DEL_OUT=$($CMD 2>&1); then
-    echo "[$(date)] Deleted snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)." | tee -a "$LOG_FILE"
+    log "[$(date)] Deleted snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)."
     echo "$REGION $SNAPSHOT deleted size:${SNAP_SIZE:-unknown} start:$SNAP_ACTUAL_START" >> "$SUCCESS_FILE"
     ((SUCC++))
   else
-    echo "[$(date)] FAIL: Could not delete snapshot $SNAPSHOT." | tee -a "$LOG_FILE"
+    log "[$(date)] FAIL: Could not delete snapshot $SNAPSHOT."
     echo "$CMD => $DEL_OUT" >> "$FAIL_FILE"
     ((FAIL++))
   fi
 done < "$CANDIDATES"
 
-echo "------ Summary ------" | tee -a "$LOG_FILE"
-echo "Candidates evaluated: $TOTAL" | tee -a "$LOG_FILE"
-echo "Deleted (or dry-run ready): $SUCC" | tee -a "$LOG_FILE"
-echo "Skipped total: $SKIP | - Missing: $MISSING | - State != completed: $STATE_SKIP | - Referenced AMIs: $REFER" | tee -a "$LOG_FILE"
-echo "Failures: $FAIL" | tee -a "$LOG_FILE"
+log "------ Summary ------"
+log "Candidates evaluated: $TOTAL"
+log "Deleted (or dry-run ready): $SUCC"
+log "Skipped total: $SKIP | - Missing: $MISSING | - State != completed: $STATE_SKIP | - Referenced AMIs: $REFER"
+log "Failures: $FAIL"
 
 RUN_STAMP="$(date +%Y%m%d-%H%M%S)"
 DEST_DIR="$LOG_DIR/${ACCOUNT_ID}_${RUN_STAMP}_SNAP_DELETE"
