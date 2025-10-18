@@ -136,7 +136,7 @@ NR > 1 {
     next
   if (launch == "")
     launch = "never"
-  print reg "|" snap "|" start "|" ami "|" state "|" launch "|" safe
+  printf "%s|%s|%s|%s|%s|%s|%s\n", reg, snap, start, ami, state, launch, safe
 }
 ' "$CSV_PATH" > "$CANDIDATES"
 
@@ -150,6 +150,14 @@ echo "[$(date)] Candidate snapshots to evaluate: $TOTAL" | tee -a "$LOG_FILE"
 
 CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
 while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG; do
+  # Trim any stray whitespace that could have slipped through (defensive)
+  REGION="${REGION#"${REGION%%[![:space:]]*}"}"; REGION="${REGION%"${REGION##*[![:space:]]}"}"
+  SNAPSHOT="${SNAPSHOT#"${SNAPSHOT%%[![:space:]]*}"}"; SNAPSHOT="${SNAPSHOT%"${SNAPSHOT##*[![:space:]]}"}"
+  CSV_AMI="${CSV_AMI#"${CSV_AMI%%[![:space:]]*}"}"; CSV_AMI="${CSV_AMI%"${CSV_AMI##*[![:space:]]}"}"
+  CSV_AMI_STATE="${CSV_AMI_STATE#"${CSV_AMI_STATE%%[![:space:]]*}"}"; CSV_AMI_STATE="${CSV_AMI_STATE%"${CSV_AMI_STATE##*[![:space:]]}"}"
+  CSV_LAUNCH="${CSV_LAUNCH#"${CSV_LAUNCH%%[![:space:]]*}"}"; CSV_LAUNCH="${CSV_LAUNCH%"${CSV_LAUNCH##*[![:space:]]}"}"
+  SNAP_START="${SNAP_START#"${SNAP_START%%[![:space:]]*}"}"; SNAP_START="${SNAP_START%"${SNAP_START##*[![:space:]]}"}"
+
   ((CNT++))
   echo "[$(date)] [$CNT/$TOTAL] Snapshot $SNAPSHOT in $REGION (CSV AMI: ${CSV_AMI:-none})" | tee -a "$LOG_FILE"
 
