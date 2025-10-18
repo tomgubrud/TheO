@@ -1,0 +1,1 @@
+us-east-2|snap-good|2020-01-01T00:00:00Z|||never|YES

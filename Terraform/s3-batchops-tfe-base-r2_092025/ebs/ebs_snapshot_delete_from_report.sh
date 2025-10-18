@@ -159,7 +159,9 @@ CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
 while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
   LINE="${LINE//$'\r'/}"
   [[ -z "$LINE" ]] && continue
+  log "[DEBUG] raw candidate line: $LINE"
   IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG <<< "$LINE"
+  log "[DEBUG] parsed -> region=$REGION snapshot=$SNAPSHOT"
 
   # Trim any stray whitespace that could have slipped through (defensive)
   REGION="${REGION#"${REGION%%[![:space:]]*}"}"; REGION="${REGION%"${REGION##*[![:space:]]}"}"
