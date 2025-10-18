@@ -1,0 +1,1 @@
+aws ec2 delete-snapshot --region us-east-2 --snapshot-id snap-good

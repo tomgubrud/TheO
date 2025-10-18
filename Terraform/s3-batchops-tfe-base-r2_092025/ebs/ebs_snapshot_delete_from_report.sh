@@ -155,7 +155,10 @@ fi
 log "[$(date)] Candidate snapshots to evaluate: $TOTAL"
 
 CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
-while IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG; do
+while IFS= read -r LINE || [[ -n "${LINE:-}" ]]; do
+  [[ -z "$LINE" ]] && continue
+  IFS='|' read -r REGION SNAPSHOT SNAP_START CSV_AMI CSV_AMI_STATE CSV_LAUNCH SAFE_FLAG <<< "$LINE"
+
   # Trim any stray whitespace that could have slipped through (defensive)
   REGION="${REGION#"${REGION%%[![:space:]]*}"}"; REGION="${REGION%"${REGION##*[![:space:]]}"}"
   SNAPSHOT="${SNAPSHOT#"${SNAPSHOT%%[![:space:]]*}"}"; SNAPSHOT="${SNAPSHOT%"${SNAPSHOT##*[![:space:]]}"}"
