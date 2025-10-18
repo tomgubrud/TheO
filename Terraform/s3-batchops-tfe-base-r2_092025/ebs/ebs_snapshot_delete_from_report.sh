@@ -165,7 +165,13 @@ fi
 
 log "[$(date)] Candidate snapshots to evaluate: $TOTAL"
 
-mapfile -t CANDIDATE_LINES < "$CANDIDATES"
+CANDIDATE_LINES=()
+LINE=""
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+  LINE="${LINE//$'\r'/}"
+  [[ -z "$LINE" ]] && continue
+  CANDIDATE_LINES+=("$LINE")
+done < "$CANDIDATES"
 
 CNT=0; SUCC=0; FAIL=0; SKIP=0; REFER=0; STATE_SKIP=0; MISSING=0
 for LINE in "${CANDIDATE_LINES[@]}"; do
