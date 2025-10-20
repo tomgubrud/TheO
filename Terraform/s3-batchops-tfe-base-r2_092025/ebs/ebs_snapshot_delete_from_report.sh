@@ -187,7 +187,7 @@ for LINE in "${CANDIDATE_LINES[@]}"; do
   CSV_LAUNCH="${CSV_LAUNCH#"${CSV_LAUNCH%%[![:space:]]*}"}"; CSV_LAUNCH="${CSV_LAUNCH%"${CSV_LAUNCH##*[![:space:]]}"}"
   SNAP_START="${SNAP_START#"${SNAP_START%%[![:space:]]*}"}"; SNAP_START="${SNAP_START%"${SNAP_START##*[![:space:]]}"}"
 
-  ((CNT++))
+  ((CNT+=1))
   log "[$(date)] [$CNT/$TOTAL] Snapshot $SNAPSHOT in $REGION (CSV AMI: ${CSV_AMI:-none})"
 
   SNAP_INFO=""
@@ -198,7 +198,7 @@ for LINE in "${CANDIDATE_LINES[@]}"; do
       --output text); then
     log "[$(date)] Snapshot $SNAPSHOT not found or access denied. Skipping."
     echo "$REGION $SNAPSHOT missing_or_denied" >> "$SKIP_FILE"
-    ((SKIP++)); ((MISSING++))
+    ((SKIP+=1)); ((MISSING+=1))
     continue
   fi
 
@@ -206,7 +206,7 @@ for LINE in "${CANDIDATE_LINES[@]}"; do
   if [[ "$SNAP_STATE" != "completed" ]]; then
     log "[$(date)] SKIP: Snapshot state is $SNAP_STATE (needs completed)."
     echo "$REGION $SNAPSHOT state:$SNAP_STATE" >> "$SKIP_FILE"
-    ((SKIP++)); ((STATE_SKIP++))
+    ((SKIP+=1)); ((STATE_SKIP+=1))
     continue
   fi
 
@@ -221,7 +221,7 @@ for LINE in "${CANDIDATE_LINES[@]}"; do
   if [[ -n "$AMI_CHECK" && "$FORCE_DELETE" != "Y" ]]; then
     log "[$(date)] SKIP: Snapshot is still referenced by AMI(s): $AMI_CHECK"
     echo "$REGION $SNAPSHOT referenced_by:$AMI_CHECK" >> "$SKIP_FILE"
-    ((SKIP++)); ((REFER++))
+    ((SKIP+=1)); ((REFER+=1))
     continue
   fi
 
@@ -231,18 +231,18 @@ for LINE in "${CANDIDATE_LINES[@]}"; do
   if [[ "$MODE" == "DRY-RUN" ]]; then
     log "[$(date)] DRY-RUN: Would delete snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)."
     echo "$REGION $SNAPSHOT dry-run size:${SNAP_SIZE:-unknown} start:$SNAP_ACTUAL_START" >> "$SUCCESS_FILE"
-    ((SUCC++))
+    ((SUCC+=1))
     continue
   fi
 
   if DEL_OUT=$(aws_capture ec2 delete-snapshot --region "$REGION" --snapshot-id "$SNAPSHOT"); then
     log "[$(date)] Deleted snapshot $SNAPSHOT ($SNAP_SIZE GiB, started $SNAP_ACTUAL_START)."
     echo "$REGION $SNAPSHOT deleted size:${SNAP_SIZE:-unknown} start:$SNAP_ACTUAL_START" >> "$SUCCESS_FILE"
-    ((SUCC++))
+    ((SUCC+=1))
   else
     log "[$(date)] FAIL: Could not delete snapshot $SNAPSHOT."
     echo "$CMD => $DEL_OUT" >> "$FAIL_FILE"
-    ((FAIL++))
+    ((FAIL+=1))
   fi
 done
 
