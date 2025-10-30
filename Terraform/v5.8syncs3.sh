@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# syncs3.sh (v5.8)
+# - Per-P1 dispatcher with background jobs, copy deltas, and master CSV
+# - Plan line shows only counts + concurrency "5/3/10 (H/M/L)"
+# - Runs H/M/L queues concurrently under the hood
+# - Kills straggler children on exit and exits cleanly (no hang)
+# ==============================================================================
+
+LOG_DIR="${LOG_DIR:-./logs}"
+LIGHT_CONC="${LIGHT_CONC:-10}"
+MED_CONC="${MED_CONC:-3}"
+HEAVY_CONC="${HEAVY_CONC:-5}"
+EXTRA_SYNC_ARGS="${EXTRA_SYNC_ARGS:-}"
+
+mkdir -p "$LOG_DIR"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+START_TS="$(date +%s)"
+MASTER_CSV="$LOG_DIR/sync_${RUN_ID}_deltas.csv"
+
+# Ensure any orphaned children are cleaned up so we never “hang” at the end.
+trap 'jobs -pr | xargs -r kill 2>/dev/null || true' EXIT
+
+# ---- colors ------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  GREEN="$(tput setaf 2 || true)"; RED="$(tput setaf 1 || true)"; YEL="$(tput setaf 3 || true)"
+  BOLD="$(tput bold || true)"; RESET="$(tput sgr0 || true)"
+else
+  GREEN=""; RED=""; YEL=""; BOLD=""; RESET=""
+fi
+
+# ---- preflight ---------------------------------------------------------------
+command -v aws >/dev/null 2>&1 || { echo "[ERROR] aws CLI not found" >&2; exit 127; }
+[[ -f ./awshelper.sh ]] || { echo "[ERROR] awshelper.sh not found" >&2; exit 1; }
+# shellcheck disable=SC1091
+source ./awshelper.sh
+[[ -n "${SRC:-}" && -n "${DST:-}" ]] || { echo "[ERROR] SRC and DST must be set (awshelper.sh)" >&2; exit 1; }
+[[ -x ./vault_keepalive.sh ]] || { echo "[ERROR] vault_keepalive.sh not found or not executable" >&2; exit 1; }
+
+# ---- helpers -----------------------------------------------------------------
+trim_slashes() { local s="${1:-}"; s="${s#/}"; s="${s%/}"; echo "$s"; }
+safe_number()  { [[ "${1:-}" =~ ^-?[0-9]+$ ]] && echo "$1" || echo 0; }
+
+# Pure-bash bytes → human text (no awk; won't hang)
+human_bytes() {
+  local b="${1:-0}" u=(B KiB MiB GiB TiB PiB) i=0
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  while (( b >= 1024 && i < ${#u[@]}-1 )); do
+    b=$(( (b*100 + 512)/1024 ))
+    ((i++))
+  done
+  if (( i==0 )); then printf "%d %s" "$b" "${u[i]}";
+  else printf "%d.%02d %s" $((b/100)) $((b%100)) "${u[i]}"; fi
+}
+
+# Convert a simple shell glob to a POSIX ERE (used to filter S3 prefixes)
+glob_to_ere() {
+  local g="$1"
+  # escape regex chars, then expand glob
+  g="${g//\//\\/}"; g="${g//./\\.}"; g="${g//\[/\\[}"; g="${g//\]/\\]}"
+  g="${g//^/\\^}"; g="${g//\$/\\$}"; g="${g//|/\\|}"; g="${g//(/\\(}"; g="${g//)/\\)}"
+  g="${g//\*/.*}"; g="${g//\?/.}"
+  printf '^%s$' "$g"
+}
+
+# Expand BASE into one or more "P0 roots" (e.g., staged/2025-10-15/ or staged/2025*/)
+# Emits an array named P0_LIST with one or more prefixes (each ends with /)
+expand_base_to_p0_list() {
+  P0_LIST=()
+
+  # Default: if BASE empty -> just top "staged/" already provided by caller
+  local base="${BASE:-}"
+  if [[ -z "$base" ]]; then
+    P0_LIST+=("staged/")
+    return
+  fi
+
+  # Normalize to always end with /
+  [[ "$base" == */ ]] || base="$base/"
+
+  # If no globs, it's a single P0 root
+  if [[ "$base" != *'*'* && "$base" != *'?'* ]]; then
+    P0_LIST+=("$base")
+    return
+  fi
+
+  # Has a glob → list under the non-glob parent and filter client-side
+  local parent="${base%%[*?]*}"
+  [[ "$parent" == */ ]] || parent="$parent/"
+
+  # Ask S3 for "folders" just under parent, then filter by glob
+  mapfile -t _candidates < <(
+    aws s3api list-objects-v2 \
+      --bucket "$SRC" \
+      --prefix "$parent" \
+      --delimiter '/' \
+      --query 'CommonPrefixes[].Prefix' \
+      --output text | tr '\t' '\n'
+  )
+
+  local ere; ere="$(glob_to_ere "$base")"
+  for p in "${_candidates[@]}"; do
+    [[ "$p" =~ $ere ]] && P0_LIST+=("$p")
+  done
+
+  # If nothing matched (typo?), keep behavior obvious
+  if ((${#P0_LIST[@]}==0)); then
+    echo "[warn] BASE pattern matched no prefixes: $BASE" >&2
+  fi
+}
+
+summarize_count_bytes() {
+  local uri="$1" out rc objs bytes
+  set +e
+  out=$(aws s3 ls "$uri" --recursive --summarize 2>/dev/null)
+  rc=$?
+  set -e
+  if (( rc != 0 )); then echo "0 0"; return; fi
+  objs=$(awk '/Total Objects:/ {print $3}' <<<"$out" | tail -n1)
+  bytes=$(awk '/Total Size:/ {print $3}'   <<<"$out" | tail -n1)
+  echo "$(safe_number "$objs") $(safe_number "$bytes")"
+}
+
+list_p1_prefixes() {
+  local base_uri="$1"
+  aws s3 ls "$base_uri" | awk '/ PRE /{print $2}'
+}
+
+# Gate inside a queue controller (subshell-local jobs)
+gate_local() {
+  local limit="${1:-0}"
+  if (( limit > 0 )); then
+    while (( $(jobs -rp | wc -l) >= limit )); do sleep 0.2; done
+  fi
+}
+
+# ---- scope / header ----------------------------------------------------------
+BASE="$(trim_slashes "${BASE:-}")"
+if [[ -n "$BASE" ]]; then
+  SRC_BASE_URI="s3://${SRC}/${BASE}/"
+  DST_BASE_URI="s3://${DST}/${BASE}/"
+  BASE_DESC="BASE=${BASE}"
+else
+  SRC_BASE_URI="s3://${SRC}/"
+  DST_BASE_URI="s3://${DST}/"
+  BASE_DESC="FULL BUCKET (all P1s)"
+fi
+
+# ---- flags / filter ----------------------------------------------------------
+FILTER="${COMPARE_FILTER:-}"
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --filter)      FILTER="${2:-}"; shift 2 ;;
+    --filter=*)    FILTER="${1#*=}"; shift ;;
+    --dry-run)     DRY_RUN=1; shift ;;
+    *)             shift ;;
+  esac
+done
+
+MODE_DESC="$BASE_DESC"
+[[ -n "$FILTER" ]] && MODE_DESC="$BASE_DESC; FILTER='${FILTER}'"
+
+echo "------------------------------------------------------------"
+echo " Sync dispatcher"
+echo " Source:       ${SRC_BASE_URI}"
+echo " Destination:  ${DST_BASE_URI}"
+echo " Mode:         ${MODE_DESC}"
+echo " Logs:         ${LOG_DIR}/sync_${RUN_ID}_<pfx>.raw.log / .err.log"
+echo " Master CSV:   ${MASTER_CSV}"
+echo "------------------------------------------------------------"
+
+# ---- list candidates ---------------------------------------------------------
+echo "[scan] Listing P1 under: ${SRC_BASE_URI}"
+
+# Derive P0 root and P1 selector from BASE to support globbing like staged/2025*/
+p0_root=""     # e.g., "staged"
+p1_sel="*"     # e.g., "2025*" (if provided), otherwise "*"
+if [[ -n "$BASE" ]]; then
+  base_trim="${BASE%/}"
+  p0_root="${base_trim%%/*}"     # first segment before first '/'
+  rest="${base_trim#*/}"         # remainder after first '/'
+  [[ "$rest" == "$base_trim" ]] && rest="*"   # only P0 given -> any P1
+  p1_sel="$rest"
+fi
+
+# List P1s relative to the chosen P0 root
+mapfile -t ALL_P1 < <(list_p1_prefixes "s3://$SRC/${p0_root:+$p0_root/}")
+
+CAND=()
+shopt -s nocasematch
+for p in "${ALL_P1[@]}"; do
+  p="${p%/}"  # normalize
+  # Match P1 selector from BASE, then apply FILTER (substring, case-insensitive)
+  if [[ "$p" == $p1_sel ]] && { [[ -z "$FILTER" ]] || [[ "${p,,}" == *"${FILTER,,}"* ]]; }; then
+    CAND+=("$p")
+  fi
+done
+shopt -u nocasematch
+
+if ((${#CAND[@]}==0)); then
+  echo "[WARN] No P1 prefixes matched (BASE='${BASE:-<none>}', FILTER='${FILTER:-<none>}'). Exiting."
+  echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
+  exit 0
+fi
+
+## ---- peek + classify ---------------------------------------------------------
+declare -A SRC_OBJS SRC_BYTES PCLASS
+LIGHT=() ; MED=() ; HEAVY=()
+TOTAL_SELECTED_OBJS=0
+TOTAL_SELECTED_BYTES=0
+
+# Recompute p0 root for URI building (same logic as above)
+p0_root=""
+if [[ -n "$BASE" ]]; then
+  base_trim="${BASE%/}"
+  p0_root="${base_trim%%/*}"
+fi
+
+for p in "${CAND[@]}"; do
+  # Build a stable peek URI: s3://$SRC/<p0>/<p1>/
+  if [[ -n "$p0_root" ]]; then
+    peek_uri="s3://$SRC/${p0_root}/${p%/}/"
+  else
+    peek_uri="s3://$SRC/${p%/}/"
+  fi
+
+  read -r cnt bytes < <(summarize_count_bytes "$peek_uri")
+  SRC_OBJS["$p"]=$cnt
+  SRC_BYTES["$p"]=$bytes          # <- fix: store the numeric variable, not the string "bytes"
+
+  (( TOTAL_SELECTED_OBJS  += cnt  ))
+  (( TOTAL_SELECTED_BYTES += bytes ))
+
+  if   (( cnt < 10  )); then LIGHT+=("$p");  PCLASS["$p"]="LIGHT"
+  elif (( cnt > 150 )); then HEAVY+=("$p");  PCLASS["$p"]="HEAVY"
+  else                     MED+=("$p");    PCLASS["$p"]="MEDIUM"
+  fi
+done
+
+echo "[plan] ${#CAND[@]} prefix(es); concurrency ${HEAVY_CONC}/${MED_CONC}/${LIGHT_CONC}  (H/M/L)"
+for p in "${CAND[@]}"; do echo " - $p"; done
+
+# ---- plan (clean display) ----------------------------------------------------
+echo "[plan] ${#CAND[@]} prefix(es); concurrency ${HEAVY_CONC}/${MED_CONC}/${LIGHT_CONC}  (H/M/L)"
+for p in "${CAND[@]}"; do printf "  - %s\n" "$p"; done
+echo
+
+# ---- dry-run -----------------------------------------------------------------
+if (( DRY_RUN == 1 )); then
+  echo "[dry-run] Would sync per-P1 with these commands:"
+  for p in "${CAND[@]}"; do
+    if [[ -n "$BASE" ]]; then
+      echo "  aws s3 sync s3://${SRC}/${BASE}/${p}  s3://${DST}/${BASE}/${p}  --exclude '*\$folder\$' --exact-timestamps --size-only --no-progress --only-show-errors"
+    else
+      echo "  aws s3 sync s3://${SRC}/${p}  s3://${DST}/${p}  --exclude '*\$folder\$' --exact-timestamps --size-only --no-progress --only-show-errors"
+    fi
+  done
+  echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
+  exit 0
+fi
+
+# ---- CSV header --------------------------------------------------------------
+echo "prefix,class,copied_objs,copied_bytes,rc" > "$MASTER_CSV"
+
+# ---- per-P1 runner -----------------------------------------------------------
+run_one_prefix() {
+  local p1="$1" class="$2"
+  local src_uri dst_uri log_base raw_log err_log
+  if [[ -n "${BASE:-}" ]]; then
+    src_uri="s3://${SRC}/${BASE}/${p1}"
+    dst_uri="s3://${DST}/${BASE}/${p1}"
+  else
+    src_uri="s3://${SRC}/${p1}"
+    dst_uri="s3://${DST}/${p1}"
+  fi
+  local safe="${p1//\//__}"
+  log_base="$LOG_DIR/sync_${RUN_ID}_${safe}"
+  raw_log="${log_base}.raw.log"
+  err_log="${log_base}.err.log"
+
+  read -r dst_pre_objs dst_pre_bytes <<<"$(summarize_count_bytes "$dst_uri")"
+
+  echo "[run] ${p1} -> ${dst_uri}" | tee -a "$raw_log"
+
+  # shellcheck disable=SC2086
+  ./vault_keepalive.sh aws s3 sync "$src_uri" "$dst_uri" \
+      --exclude '*$folder$' \
+      --exact-timestamps \
+      --size-only \
+      --no-progress \
+      --only-show-errors \
+      $EXTRA_SYNC_ARGS \
+      >>"$raw_log" 2>>"$err_log"
+  local rc=$?
+
+  read -r dst_post_objs dst_post_bytes <<<"$(summarize_count_bytes "$dst_uri")"
+  local copied_objs=$(( dst_post_objs - dst_pre_objs ))
+  local copied_bytes=$(( dst_post_bytes - dst_pre_bytes ))
+
+  if (( rc == 0 )); then
+    if (( copied_objs > 0 || copied_bytes > 0 )); then
+      echo "[done] ${p1} copied: ${copied_objs} objs ($(human_bytes "$copied_bytes"))" | tee -a "$raw_log"
+    else
+      echo "[done] ${p1} already up-to-date" | tee -a "$raw_log"
+    fi
+  else
+    echo "[FAIL] ${p1} (rc=${rc}) — see ${err_log}" | tee -a "$raw_log"
+  fi
+
+  printf "%s,%s,%s,%s,%s\n" "$p1" "$class" "$copied_objs" "$copied_bytes" "$rc" \
+    | tee -a "$MASTER_CSV" > "${log_base}.delta.csv"
+  return $rc
+}
+
+# ---- aggregation helpers -----------------------------------------------------
+TOTAL_COPIED_OBJS=0
+TOTAL_COPIED_BYTES=0
+ALREADY_UP_TO_DATE=0
+aggregate_delta_csv() {
+  local csv="$1"
+  [[ -s "$csv" ]] || return 0
+  IFS=',' read -r _pfx _class d_objs d_bytes _rc < "$csv" || return 0
+  d_objs=$(safe_number "${d_objs:-0}")
+  d_bytes=$(safe_number "${d_bytes:-0}")
+  (( TOTAL_COPIED_OBJS += d_objs ))
+  (( TOTAL_COPIED_BYTES += d_bytes ))
+  if (( d_objs == 0 && d_bytes == 0 )); then (( ALREADY_UP_TO_DATE += 1 )); fi
+}
+
+# ---- launch queues concurrently ----------------------------------------------
+controller_pids=()
+echo "[run] Dispatching concurrent sync jobs..."
+
+if ((${#HEAVY[@]})); then
+  (
+    for p in "${HEAVY[@]}"; do gate_local "$HEAVY_CONC"; run_one_prefix "$p" "HEAVY" </dev/null & done
+    wait
+  ) & controller_pids+=("$!")
+fi
+if ((${#MED[@]})); then
+  (
+    for p in "${MED[@]}"; do gate_local "$MED_CONC"; run_one_prefix "$p" "MEDIUM" </dev/null & done
+    wait
+  ) & controller_pids+=("$!")
+fi
+if ((${#LIGHT[@]})); then
+  (
+    for p in "${LIGHT[@]}"; do gate_local "$LIGHT_CONC"; run_one_prefix "$p" "LIGHT" </dev/null & done
+    wait
+  ) & controller_pids+=("$!")
+fi
+
+for pid in "${controller_pids[@]:-}"; do
+  wait "$pid"
+done
+
+# Aggregate deltas
+for p in "${HEAVY[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
+for p in "${MED[@]}";   do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
+for p in "${LIGHT[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
+
+# ---- summary (always prints) -------------------------------------------------
+echo "================= Summary (RUN ${RUN_ID}) ================="
+
+# Defensive defaults
+: "${TOTAL_SELECTED_OBJS:=0}"
+: "${TOTAL_SELECTED_BYTES:=0}"
+: "${TOTAL_COPIED_OBJS:=0}"
+: "${TOTAL_COPIED_BYTES:=0}"
+: "${ALREADY_UP_TO_DATE:=0}"
+
+# Convert bytes to readable strings (reuses human_bytes helper)
+hb_sel="$(human_bytes "$TOTAL_SELECTED_BYTES")"
+hb_cop="$(human_bytes "$TOTAL_COPIED_BYTES")"
+
+printf " Selected P1 total (SRC peek): %12d  (%s)\n" \
+       "$TOTAL_SELECTED_OBJS" "$hb_sel"
+
+printf " Total copied (DST delta):     %12d  (%s)\n" \
+       "$TOTAL_COPIED_OBJS" "$hb_cop"
+
+printf " Already up-to-date P1s:       %12d  / %d\n" \
+       "$ALREADY_UP_TO_DATE" "${#CAND[@]}"
+
+printf " Concurrency (H/M/L):          %d/%d/%d\n" \
+       "$HEAVY_CONC" "$MED_CONC" "$LIGHT_CONC"
+
+printf " Elapsed:                      %ss\n" "$ELAPSED"
+printf " Logs:                         %s/sync_%s_<pfx>.raw.log  (+ .err.log)\n" "$LOG_DIR" "$RUN_ID"
+printf " Master CSV:                   %s\n" "$MASTER_CSV"
+echo "=========================================================="
+
+# Defensive final wait (won't hang if no background jobs)
+wait || true
+exit 0
