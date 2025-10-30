@@ -206,6 +206,7 @@ if ((${#CAND[@]}==0)); then
   exit 0
 fi
 
+
 ## ---- peek + classify ---------------------------------------------------------
 declare -A SRC_OBJS SRC_BYTES PCLASS
 LIGHT=() ; MED=() ; HEAVY=()
@@ -363,7 +364,12 @@ for p in "${MED[@]}";   do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//
 for p in "${LIGHT[@]}"; do aggregate_delta_csv "$LOG_DIR/sync_${RUN_ID}_${p//\//__}.delta.csv"; done
 
 # ---- summary (always prints) -------------------------------------------------
+
 echo "================= Summary (RUN ${RUN_ID}) ================="
+# ---- right before the summary block --------------------------
+END_TS="$(date +%s)"
+ELAPSED="$(( END_TS - START_TS ))"
+: "${ELAPSED:=0}"   # defensive default
 
 # Defensive defaults
 : "${TOTAL_SELECTED_OBJS:=0}"
