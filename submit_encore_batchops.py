@@ -16,8 +16,13 @@ session      = boto3.Session(profile_name=PROFILE)
 s3_client    = session.client("s3", region_name=REGION)
 batch_client = session.client("s3control", region_name=REGION)
 
-# TEST: hardcoded single date folder
-date_folders = ["20230103/"]
+print("Fetching date folders from source bucket...")
+date_folders = []
+paginator = s3_client.get_paginator("list_objects_v2")
+pages = paginator.paginate(Bucket=SOURCE_BUCKET, Delimiter="/")
+for page in pages:
+    for prefix in page.get("CommonPrefixes", []):
+        date_folders.append(prefix["Prefix"])
 print(f"Found {len(date_folders)} date folders")
 
 # Discover folders dynamically, excluding mct and tce

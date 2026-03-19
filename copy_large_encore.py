@@ -89,10 +89,14 @@ def main():
     get_s3()
     s3 = get_s3()
 
-    # TEST: hardcoded single date folder
-    date_folders = ["20230103/"]
+    print(f"[{_ts()}] Listing date folders...")
+    date_folders = []
+    pager = s3.get_paginator("list_objects_v2")
+    for page in pager.paginate(Bucket=SOURCE_BUCKET, Delimiter="/"):
+        for p in page.get("CommonPrefixes", []):
+            date_folders.append(p["Prefix"])
     print(f"[{_ts()}] Found {len(date_folders)} date folders")
-
+    
     # Discover folders dynamically, excluding mct and tce
     EXCLUDE = {"mct", "tce"}
     folders_set = set()
