@@ -18,14 +18,14 @@ import time
 from boto3.s3.transfer import TransferConfig
 from datetime import datetime
 
-SOURCE_BUCKET        = "occ-prd-00-a1g-data-app-s3-data-encore"
-DEST_BUCKET          = "dp-prd-00-aog-data-dcc-s3-dcopyraw"
-ROLE_ARN             = "arn:aws:iam::920373001042:role/S3BatchOperations-COPY-encore"
-REGION               = "us-east-2"
-PROFILE              = "1042"
-SIZE_THRESHOLD       = 5368709120    # 5 GiB — copy files >= this size
-MAX_WORKERS          = 16            # parallel file copies
-LOG_FILE             = "copy_large_encore.csv"
+SOURCE_BUCKET         = "occ-prd-00-a1g-data-app-s3-data-encore"
+DEST_BUCKET           = "dp-prd-00-aog-data-dcc-s3-dcopyraw"
+ROLE_ARN              = "arn:aws:iam::920373001042:role/S3BatchOperations-COPY-encore"
+REGION                = "us-east-2"
+PROFILE               = "1042"
+SIZE_THRESHOLD        = 5368709120   # 5 GiB — copy files >= this size
+MAX_WORKERS           = 16           # parallel file copies
+LOG_FILE              = "copy_large_encore.csv"
 CRED_REFRESH_INTERVAL = 45 * 60     # refresh assumed-role creds every 45 min
 
 TRANSFER_CONFIG = TransferConfig(
@@ -37,9 +37,9 @@ TRANSFER_CONFIG = TransferConfig(
 
 # --- Credential refresh ---
 
-_cred_lock   = threading.Lock()
-_s3_client   = None
-_cred_time   = 0
+_cred_lock = threading.Lock()
+_s3_client = None
+_cred_time = 0
 
 def _refresh_client():
     global _s3_client, _cred_time
@@ -89,12 +89,8 @@ def main():
     get_s3()
     s3 = get_s3()
 
-    print(f"[{_ts()}] Listing date folders...")
-    date_folders = []
-    pager = s3.get_paginator("list_objects_v2")
-    for page in pager.paginate(Bucket=SOURCE_BUCKET, Delimiter="/"):
-        for p in page.get("CommonPrefixes", []):
-            date_folders.append(p["Prefix"])
+    # TEST: hardcoded single date folder
+    date_folders = ["20230103/"]
     print(f"[{_ts()}] Found {len(date_folders)} date folders")
 
     # Discover folders dynamically, excluding mct and tce
@@ -103,7 +99,8 @@ def main():
     for date_folder in date_folders:
         resp = s3.list_objects_v2(Bucket=SOURCE_BUCKET, Prefix=f"{date_folder}input/", Delimiter="/")
         for p in resp.get("CommonPrefixes", []):
-            folder = p["Prefix"].rstrip("/").split("/")[-1]
+            parts = p["Prefix"].rstrip("/").split("/")
+            folder = parts[2]  # e.g. "20230103/input/mct/" -> parts[2] = "mct"
             if folder not in EXCLUDE:
                 folders_set.add(folder)
     FOLDERS = list(folders_set)
